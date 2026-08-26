@@ -14,32 +14,138 @@
 # limitations under the License.
 """
 
+from typing import Optional
+
 import paddle
 
 from fastdeploy.platforms import current_platform
 
 
 def apply_penalty_multi_scores(
-    prompt_token_ids: paddle.Tensor,
+    token_ids_all: paddle.Tensor,
     logits: paddle.Tensor,
     repetition_penalties: paddle.Tensor,
     frequency_penalties: paddle.Tensor,
     presence_penalties: paddle.Tensor,
     temperature: paddle.Tensor,
     bad_words_token_ids: paddle.Tensor,
+    bad_words_token_len: paddle.Tensor,
+    prompt_lens: paddle.Tensor,
     step_idx: paddle.Tensor,
     min_dec_lens: paddle.Tensor,
     eos_token_ids: paddle.Tensor,
-):
+    pre_token_ids: Optional[paddle.Tensor] = None,  # used in dcu, xpu, gcu, intel_hpu
+) -> paddle.Tensor:
     """
-    Args:
-    Returns:
+    apply_penalty_multi_scores
     """
     if current_platform.is_cuda():
-        from fastdeploy.model_executor.ops.gpu import \
-            get_token_penalty_multi_scores
+        from fastdeploy.model_executor.ops.gpu import get_token_penalty_multi_scores
+
         logits = get_token_penalty_multi_scores(
-            prompt_token_ids,
+            token_ids_all,
+            logits,
+            repetition_penalties,
+            frequency_penalties,
+            presence_penalties,
+            temperature,
+            bad_words_token_ids,
+            bad_words_token_len,
+            prompt_lens,
+            step_idx,
+            min_dec_lens,
+            eos_token_ids,
+        )
+    elif current_platform.is_dcu():
+        from fastdeploy.model_executor.ops.gpu import get_token_penalty_multi_scores
+
+        logits = get_token_penalty_multi_scores(
+            token_ids_all,
+            logits,
+            repetition_penalties,
+            frequency_penalties,
+            presence_penalties,
+            temperature,
+            bad_words_token_ids,
+            bad_words_token_len,
+            prompt_lens,
+            step_idx,
+            min_dec_lens,
+            eos_token_ids,
+        )
+    elif current_platform.is_xpu():
+        from fastdeploy.model_executor.ops.xpu import get_token_penalty_multi_scores
+
+        logits = get_token_penalty_multi_scores(
+            token_ids_all,
+            logits,
+            repetition_penalties,
+            frequency_penalties,
+            presence_penalties,
+            temperature,
+            bad_words_token_ids,
+            step_idx,
+            min_dec_lens,
+            eos_token_ids,
+        )
+    elif current_platform.is_iluvatar():
+        from fastdeploy.model_executor.ops.iluvatar import (
+            get_token_penalty_multi_scores,
+        )
+
+        logits = get_token_penalty_multi_scores(
+            token_ids_all,
+            logits,
+            repetition_penalties,
+            frequency_penalties,
+            presence_penalties,
+            temperature,
+            bad_words_token_ids,
+            bad_words_token_len,
+            prompt_lens,
+            step_idx,
+            min_dec_lens,
+            eos_token_ids,
+        )
+    elif current_platform.is_gcu():
+        from fastdeploy.model_executor.ops.gcu import get_token_penalty_multi_scores
+
+        logits = get_token_penalty_multi_scores(
+            pre_token_ids,
+            logits,
+            repetition_penalties,
+            frequency_penalties,
+            presence_penalties,
+            temperature,
+            bad_words_token_ids,
+            step_idx,
+            min_dec_lens,
+            eos_token_ids,
+        )
+    elif current_platform.is_maca():
+        from fastdeploy.model_executor.ops.gpu import get_token_penalty_multi_scores
+
+        logits = get_token_penalty_multi_scores(
+            token_ids_all,
+            logits,
+            repetition_penalties,
+            frequency_penalties,
+            presence_penalties,
+            temperature,
+            bad_words_token_ids,
+            bad_words_token_len,
+            prompt_lens,
+            step_idx,
+            min_dec_lens,
+            eos_token_ids,
+        )
+    elif current_platform.is_intel_hpu():
+        from fastdeploy.model_executor.ops.intel_hpu import (
+            get_token_penalty_multi_scores,
+        )
+
+        logits = get_token_penalty_multi_scores(
+            pre_token_ids,
             logits,
             repetition_penalties,
             frequency_penalties,
@@ -51,6 +157,125 @@ def apply_penalty_multi_scores(
             eos_token_ids,
         )
     else:
-        raise NotImplementedError()
+        raise NotImplementedError
 
+    return logits
+
+
+def apply_speculative_penalty_multi_scores(
+    token_ids_all: paddle.Tensor,
+    prompt_lens: paddle.Tensor,
+    logits: paddle.Tensor,
+    repetition_penalties: paddle.Tensor,
+    frequency_penalties: paddle.Tensor,
+    presence_penalties: paddle.Tensor,
+    temperature: paddle.Tensor,
+    bad_words_token_ids: paddle.Tensor,
+    bad_tokens_len: paddle.Tensor,
+    step_idx: paddle.Tensor,
+    min_dec_lens: paddle.Tensor,
+    eos_token_ids: paddle.Tensor,
+    seq_lens_this_time: paddle.Tensor,
+    batch_id_per_token_output: paddle.Tensor,
+    cu_seqlens_q_output: paddle.Tensor,
+    max_len: int,
+):
+    """
+    apply_speculative_penalty_multi_scores
+    """
+    if current_platform.is_cuda() or current_platform.is_maca():
+        from fastdeploy.model_executor.ops.gpu import (
+            speculate_get_token_penalty_multi_scores,
+        )
+
+        speculate_get_token_penalty_multi_scores(
+            token_ids_all,
+            prompt_lens,
+            logits,
+            repetition_penalties,
+            frequency_penalties,
+            presence_penalties,
+            temperature,
+            bad_words_token_ids,
+            bad_tokens_len,
+            step_idx,
+            min_dec_lens,
+            eos_token_ids,
+            seq_lens_this_time,
+            batch_id_per_token_output,
+            cu_seqlens_q_output,
+            max_len,
+        )
+    elif current_platform.is_xpu():
+        from fastdeploy.model_executor.ops.xpu import (
+            speculate_get_token_penalty_multi_scores,
+        )
+
+        speculate_get_token_penalty_multi_scores(
+            token_ids_all,
+            logits,
+            repetition_penalties,
+            frequency_penalties,
+            presence_penalties,
+            temperature,
+            bad_words_token_ids,
+            step_idx,
+            min_dec_lens,
+            eos_token_ids,
+            seq_lens_this_time,
+            batch_id_per_token_output,
+            cu_seqlens_q_output,
+            max_len,
+        )
+
+    else:
+        raise NotImplementedError
+
+    # inplace
+    return logits
+
+
+def reasoning_phase_token_constraint(
+    logits: paddle.Tensor,
+    token_ids_all: paddle.Tensor,
+    prompt_lens: paddle.Tensor,
+    stop_flags: paddle.Tensor,
+    seq_lens_this_time: paddle.Tensor,
+    seq_lens_encoder: paddle.Tensor,
+    step_idx: paddle.Tensor,
+    reasoning_allowed_tokens: paddle.Tensor,
+    reasoning_status: paddle.Tensor,
+    batch_id_per_token_output: paddle.Tensor,
+    cu_seqlens_q_output: paddle.Tensor,
+    enable_thinking: paddle.Tensor,
+    think_end_id: int,
+    line_break_id: int,
+):
+    """
+    reasoning_phase_token_constraint
+    """
+    if current_platform.is_cuda():
+        from fastdeploy.model_executor.ops.gpu import reasoning_phase_token_constraint
+    elif current_platform.is_xpu():
+        from fastdeploy.model_executor.ops.xpu import reasoning_phase_token_constraint
+    else:
+        raise NotImplementedError
+
+    reasoning_phase_token_constraint(
+        logits,
+        token_ids_all,
+        prompt_lens,
+        stop_flags,
+        seq_lens_this_time,
+        seq_lens_encoder,
+        step_idx,
+        reasoning_allowed_tokens,
+        reasoning_status,
+        batch_id_per_token_output,
+        cu_seqlens_q_output,
+        enable_thinking,
+        think_end_id,
+        line_break_id,
+    )
+    # inplace
     return logits

@@ -15,19 +15,21 @@
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 import paddle
+
+from fastdeploy.model_executor.logits_processor import LogitsProcessor
 
 
 @dataclass
 class SamplingMetadata:
     """
+    metadata for sampling.
     """
 
     temperature: paddle.Tensor
 
-    prompt_token_ids: paddle.Tensor
     eos_token_ids: paddle.Tensor
     frequency_penalties: paddle.Tensor
     presence_penalties: paddle.Tensor
@@ -40,4 +42,30 @@ class SamplingMetadata:
     step_idx: paddle.Tensor
 
     top_p: paddle.Tensor
+    top_p_list: Optional[list] = None
+    # only GPU used
+    bad_words_token_len: Optional[paddle.Tensor] = None
     top_k: Optional[paddle.Tensor] = None
+    top_k_list: Optional[list] = None
+    min_p: Optional[paddle.Tensor] = None
+    min_p_list: Optional[list] = None
+    seed: Optional[paddle.Tensor] = None
+    max_num_logprobs: Optional[int] = None
+    enable_early_stop: Optional[int] = False
+    stop_flags: Optional[paddle.Tensor] = None
+    pre_token_ids: Optional[paddle.Tensor] = None  # generated tokens
+    token_ids_all: Optional[paddle.Tensor] = None  # prompt + generated tokens
+    prompt_ids: Optional[paddle.Tensor] = None
+    prompt_lens: Optional[paddle.Tensor] = None
+    fake_prompt_lens: Optional[paddle.Tensor] = None  # TODO[minghaipeng]: remove this later
+    temp_scaled_logprobs_flag: Optional[bool] = None
+    top_p_normalized_logprobs_flag: Optional[bool] = None
+    temp_scaled_logprobs: Optional[paddle.Tensor] = None
+    top_p_normalized_logprobs: Optional[paddle.Tensor] = None
+    share_inputs: Optional[Dict[str, paddle.Tensor]] = None
+    logits_processors: Optional[list[LogitsProcessor]] = None
+    # Add for HPU post-processing
+    seq_lens_encoder: Optional[paddle.Tensor] = None
+    seq_lens_decoder: Optional[paddle.Tensor] = None
+    # Add for sampler to distinguish dummy run and profile run
+    is_dummy_or_profile_run: bool = False

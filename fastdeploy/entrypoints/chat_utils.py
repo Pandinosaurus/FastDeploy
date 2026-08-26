@@ -14,55 +14,66 @@
 # limitations under the License.
 """
 
-from typing import Literal, Union, List
-from typing_extensions import Required, TypedDict, TypeAlias
-
-from openai.types.chat import ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
-from openai.types.chat import ChatCompletionMessageParam as OpenAIChatCompletionMessageParam
-
+import os
+import time
+import uuid
+from pathlib import Path
+from typing import List, Literal, Optional, Union
 from urllib.parse import urlparse
-import requests
-from copy import deepcopy
 
-from fastdeploy.input.multimodal.video import VideoMediaIO
-from fastdeploy.input.multimodal.image import ImageMediaIO
+import requests
+from openai.types.chat import (
+    ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam,
+)
+from openai.types.chat import (
+    ChatCompletionMessageParam as OpenAIChatCompletionMessageParam,
+)
+from openai.types.chat.chat_completion_content_part_image_param import ImageURL
+from typing_extensions import Required, TypeAlias, TypedDict
+
+from fastdeploy.multimodal.image import ImageMediaIO
+from fastdeploy.multimodal.video import VideoMediaIO
+from fastdeploy.utils import api_server_logger
+
+
+class CustomChatCompletionContentPartImageParam(TypedDict, total=False):
+    """Custom Image URL object"""
+
+    type: Required[Literal["image_url"]]
+    """The type of the content part."""
+
+    image_url: Optional[ImageURL]
+
+    uuid: Optional[str]
+
 
 class VideoURL(TypedDict, total=False):
-    """
-    Represents a video URL or base64 encoded video data.
-    
-    Attributes:
-        url: Required string containing either a URL or base64 encoded video data
-    """
+    """Video URL object"""
+
     url: Required[str]
     """Either a URL of the video or the base64 encoded video data"""
 
+
 class CustomChatCompletionContentPartVideoParam(TypedDict, total=False):
-    """
-    Custom video content part parameter for chat completion.
-    
-    Attributes:
-        video_url: Required VideoURL object containing video data
-        type: Required literal string "video_url" indicating content type
-    """
-    video_url: Required[VideoURL]
+    """Custom Video URL object"""
 
     type: Required[Literal["video_url"]]
-    """The type of the content type."""
+    """The type of the content part."""
+
+    video_url: Optional[VideoURL]
+
+    uuid: Optional[str]
+
 
 CustomChatCompletionContentPartParam: TypeAlias = Union[
-    OpenAIChatCompletionContentPartParam, CustomChatCompletionContentPartVideoParam
+    OpenAIChatCompletionContentPartParam,
+    CustomChatCompletionContentPartImageParam,
+    CustomChatCompletionContentPartVideoParam,
 ]
 
-class CustomUserChatCompletionMessageParam(TypedDict, total=False):
-    """
-    Custom user chat message parameter for chat completion.
-    
-    Attributes:
-        content: Required content of the message (string or list of content parts)
-        role: Required string indicating the role of message author (should be 'user')
-        name: Optional name to differentiate between participants of same role
-    """
+
+class CustomChatCompletionMessageParam(TypedDict, total=False):
+    """Custom User chat message parameter."""
 
     content: Required[Union[str, List[CustomChatCompletionContentPartParam]]]
     """The contents of the user message"""
@@ -76,65 +87,53 @@ class CustomUserChatCompletionMessageParam(TypedDict, total=False):
     Provides the model information to differentiate between participants of the same role.
     """
 
-ChatCompletionMessageParam = Union[OpenAIChatCompletionMessageParam, CustomUserChatCompletionMessageParam]
+
+ChatCompletionMessageParam = Union[OpenAIChatCompletionMessageParam, CustomChatCompletionMessageParam]
 
 
-class MultiModalPartParser(object):
-    """
-    Parser for handling multi-modal content parts (images, videos, etc.)
-    
-    Attributes:
-        image_io: ImageMediaIO instance for handling image operations
-        video_io: VideoMediaIO instance for handling video operations
-    """
+class MultimodalPartParser:
+    """Multi Modal Part parser"""
+
     def __init__(self):
         self.image_io = ImageMediaIO()
-        self.video_io = VideoMediaIO(self.image_io)
+        self.video_io = VideoMediaIO()
 
     def parse_image(self, image_url):
-        """
-        Parse an image from given URL.
-        
-        Args:
-            image_url: URL or base64 string of the image
-            
-        Returns:
-            Parsed image data
-        """
-        # image_io = ImageMediaIO()
+        """ "Parse Image"""
         return self.load_from_url(image_url, self.image_io)
 
     def parse_video(self, video_url):
-        """
-        Parse a video from given URL.
-        
-        Args:
-            video_url: URL or base64 string of the video
-            
-        Returns:
-            Parsed video data
-        """
-        # video_io = VideoMediaIO()
-        return self.get_bytes(video_url)
+        """Parse Video"""
+        return self.load_from_url(video_url, self.video_io)
 
+    def http_get_with_retry(self, url, max_retries=3, retry_delay=1, backoff_factor=2):
+        """HTTP GET retry"""
+
+        retry_cnt = 0
+        delay = retry_delay
+
+        while retry_cnt < max_retries:
+            try:
+                response = requests.get(url)
+                response.raise_for_status()
+                return response.content
+            except Exception as e:
+                retry_cnt += 1
+                if retry_cnt >= max_retries:
+                    api_server_logger.error(f"HTTP GET failed: {e}. Max retries reached")
+                    raise
+                api_server_logger.info(f"HTTP GET failed: {e}. Start retry {retry_cnt}")
+                time.sleep(delay)
+                delay *= backoff_factor
 
     def load_from_url(self, url, media_io):
-        """
-        Load media content from URL or base64 string.
-        
-        Args:
-            url: URL or base64 string of the media
-            media_io: MediaIO instance for handling the specific media type
-            
-        Returns:
-            Loaded media data
-        """
+        """Load media from URL"""
 
         parsed = urlparse(url)
         if parsed.scheme.startswith("http"):
-            media_bytes = self.get_bytes(url)
+            media_bytes = self.http_get_with_retry(url)
             return media_io.load_bytes(media_bytes)
-        
+
         if parsed.scheme.startswith("data"):
             data_spec, data = parsed.path.split(",", 1)
             media_type, data_type = data_spec.split(";", 1)
@@ -144,35 +143,9 @@ class MultiModalPartParser(object):
             localpath = parsed.path
             return media_io.load_file(localpath)
 
-    def get_bytes(self, url):
-        """
-        Fetch raw bytes from a URL.
-        
-        Args:
-            url: URL to fetch data from
-            
-        Returns:
-            bytes: Raw content from the URL
-        """
-        # TODO: Add error handling and timeout
-        return requests.get(url).content
-
 
 def parse_content_part(mm_parser, part):
-    """
-    Parse a single content part (text, image or video).
-    Currently supports OpenAI-compatible formats.
-    
-    Args:
-        mm_parser: MultiModalPartParser instance
-        part: Content part to parse
-        
-    Returns:
-        dict: Parsed content part
-        
-    Raises:
-        ValueError: If content part type is unknown
-    """
+    """only support openai compatible format for now"""
 
     part_type = part.get("type", None)
 
@@ -180,39 +153,46 @@ def parse_content_part(mm_parser, part):
         return part
 
     if part_type == "image_url":
-        content = part.get("image_url", {}).get("url", None)
-        image = mm_parser.parse_image(content)
-        parsed = deepcopy(part)
-        del parsed["image_url"]["url"]
-        parsed["image"] = image
-        parsed["type"] = "image"
-        return parsed
+        if not part.get("image_url", None) and not part.get("uuid", None):
+            raise ValueError("Both image_url and uuid are missing")
 
+        if part.get("image_url", None):
+            url = part["image_url"]["url"]
+            image = mm_parser.parse_image(url)
+        else:
+            image = None
+
+        parsed = {}
+        parsed["type"] = "image"
+        parsed["data"] = image
+        parsed["uuid"] = part.get("uuid", None)
+
+        return parsed
     if part_type == "video_url":
-        content = part.get("video_url", {}).get("url", None)
-        video = mm_parser.parse_video(content)
-        parsed = deepcopy(part)
-        del parsed["video_url"]["url"]
-        parsed["video"] = video
+        if not part.get("video_url", None) and not part.get("uuid", None):
+            raise ValueError("Both video_url and uuid are missing")
+
+        if part.get("video_url", None):
+            url = part["video_url"]["url"]
+            video = mm_parser.parse_video(url)
+        else:
+            video = None
+
+        parsed = {}
         parsed["type"] = "video"
+        parsed["data"] = video
+        parsed["uuid"] = part.get("uuid", None)
+
         return parsed
 
     raise ValueError(f"Unknown content part type: {part_type}")
 
-#TODO async
-#def parse_chat_messages(messages: List[ChatCompletionMessageParam]):
-def parse_chat_messages(messages):
-    """
-    Parse a list of chat messages into standardized format.
-    
-    Args:
-        messages: List of chat messages to parse
-        
-    Returns:
-        list: Parsed conversation in standardized format
-    """
 
-    mm_parser = MultiModalPartParser()
+# TODO async
+def parse_chat_messages(messages: List[ChatCompletionMessageParam]):
+    """Parse chat messages to [dict]"""
+
+    mm_parser = MultimodalPartParser()
 
     conversation = []
     for message in messages:
@@ -229,3 +209,45 @@ def parse_chat_messages(messages):
 
         conversation.append({"role": role, "content": parsed_content})
     return conversation
+
+
+def load_chat_template(
+    chat_template: Union[Path, str],
+    model_path: Path = None,
+    is_literal: bool = False,
+) -> Optional[str]:
+    if chat_template is None:
+        if model_path:
+            chat_template_file = os.path.join(model_path, "chat_template.jinja")
+            if os.path.exists(chat_template_file):
+                with open(chat_template_file) as f:
+                    return f.read()
+        return None
+    if is_literal:
+        if isinstance(chat_template, Path):
+            raise TypeError("chat_template is expected to be read directly " "from its value")
+
+        return chat_template
+
+    try:
+        with open(chat_template) as f:
+            return f.read()
+    except OSError as e:
+        if isinstance(chat_template, Path):
+            raise
+        JINJA_CHARS = "{}\n"
+        if not any(c in chat_template for c in JINJA_CHARS):
+            msg = (
+                f"The supplied chat template ({chat_template}) "
+                f"looks like a file path, but it failed to be "
+                f"opened. Reason: {e}"
+            )
+            raise ValueError(msg) from e
+
+        # If opening a file fails, set chat template to be args to
+        # ensure we decode so our escape are interpreted correctly
+        return load_chat_template(chat_template, is_literal=True)
+
+
+def random_tool_call_id() -> str:
+    return f"chatcmpl-tool-{str(uuid.uuid4().hex)}"

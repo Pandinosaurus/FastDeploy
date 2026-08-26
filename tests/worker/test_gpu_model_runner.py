@@ -1,0 +1,1217 @@
+# Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import unittest
+from dataclasses import dataclass
+from unittest.mock import MagicMock, Mock, patch
+
+import numpy as np
+import paddle
+
+from fastdeploy.config import PREEMPTED_TOKEN_ID
+from fastdeploy.engine.request import ImagePosition
+from fastdeploy.spec_decode import SpecMethod
+from fastdeploy.worker.gpu_model_runner import GPUModelRunner
+from fastdeploy.worker.input_batch import InputBatch
+
+
+@dataclass
+class TestRequest:
+    multimodal_inputs: dict = None
+
+
+class TestFeaturePositions(unittest.TestCase):
+
+    def setUp(self):
+        # Create a mock GPUModelRunner instance for testing
+        self.mock_fd_config = Mock()
+        self.mock_model_config = Mock()
+        self.mock_model_config.enable_mm = True
+        self.mock_fd_config.model_config = self.mock_model_config
+
+        # Mock other necessary configurations
+        self.mock_fd_config.scheduler_config = Mock()
+        self.mock_fd_config.scheduler_config.max_num_seqs = 10
+        self.mock_fd_config.parallel_config = Mock()
+        self.mock_fd_config.parallel_config.tensor_parallel_size = 1
+
+        self.runner = GPUModelRunner.__new__(GPUModelRunner)
+        self.runner.fd_config = self.mock_fd_config
+        self.runner.model_config = self.mock_model_config
+        self.runner.scheduler_config = self.mock_fd_config.scheduler_config
+
+    def test_completely_within_range(self):
+        """Test positions that are completely within the prefill range"""
+        mm_positions = [
+            ImagePosition(offset=10, length=5),  # [10, 14]
+            ImagePosition(offset=15, length=5),  # [15, 19]
+        ]
+        prefill_start_index = 10
+        prefill_end_index = 20
+
+        result = self.runner._get_feature_positions(mm_positions, prefill_start_index, prefill_end_index)
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0].offset, 0)
+        self.assertEqual(result[0].length, 5)
+        self.assertEqual(result[1].offset, 0)
+        self.assertEqual(result[1].length, 5)
+
+    def test_completely_outside_range(self):
+        """Test positions that are completely outside the prefill range"""
+        mm_positions = [
+            ImagePosition(offset=5, length=3),  # [5, 7] - before range
+            ImagePosition(offset=25, length=5),  # [25, 29] - after range
+        ]
+        prefill_start_index = 10
+        prefill_end_index = 20
+
+        result = self.runner._get_feature_positions(mm_positions, prefill_start_index, prefill_end_index)
+
+        self.assertEqual(len(result), 0)
+
+    def test_partial_overlap_start(self):
+        """Test positions that partially overlap at the start of the range"""
+        mm_positions = [
+            ImagePosition(offset=8, length=5),  # [8, 12] overlaps with [10, 20]
+        ]
+        prefill_start_index = 10
+        prefill_end_index = 20
+
+        result = self.runner._get_feature_positions(mm_positions, prefill_start_index, prefill_end_index)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].offset, 2)  # Adjusted to start at prefill_start_index
+        self.assertEqual(result[0].length, 3)  # Length reduced to fit within range
+
+    def test_partial_overlap_end(self):
+        """Test positions that partially overlap at the end of the range"""
+        mm_positions = [
+            ImagePosition(offset=8, length=50),  # [8, 58] overlaps with [10, 20]
+        ]
+        prefill_start_index = 10
+        prefill_end_index = 20
+
+        result = self.runner._get_feature_positions(mm_positions, prefill_start_index, prefill_end_index)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].offset, 2)  # Offset remains the same
+        self.assertEqual(result[0].length, 10)  # Length reduced to fit within range
+
+    def test_exact_range_boundary(self):
+        """Test positions that exactly match the range boundaries"""
+        mm_positions = [
+            ImagePosition(offset=10, length=10),  # Exactly matches [10, 20]
+        ]
+        prefill_start_index = 10
+        prefill_end_index = 20
+
+        result = self.runner._get_feature_positions(mm_positions, prefill_start_index, prefill_end_index)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].offset, 0)
+        self.assertEqual(result[0].length, 10)
+
+    def test_edge_overlap(self):
+        """Test positions that exactly touch the range boundaries"""
+        mm_positions = [
+            ImagePosition(offset=20, length=5),  # Starts exactly at end boundary but should be excluded
+        ]
+        prefill_start_index = 10
+        prefill_end_index = 20
+
+        result = self.runner._get_feature_positions(mm_positions, prefill_start_index, prefill_end_index)
+
+        self.assertEqual(len(result), 0)  # Should be excluded - ends at boundary means outside
+
+    def test_multiple_overlapping_positions(self):
+        """Test mixed positions with different overlap scenarios"""
+        mm_positions = [
+            ImagePosition(offset=5, length=3),  # [5, 8] - before range
+            ImagePosition(offset=8, length=5),  # [8, 13] - overlaps start
+            ImagePosition(offset=13, length=6),  # [13, 19] - completely within
+            ImagePosition(offset=19, length=5),  # [19, 24] - overlaps end
+            ImagePosition(offset=24, length=3),  # [24, 27] - after range
+        ]
+        prefill_start_index = 10
+        prefill_end_index = 20
+
+        result = self.runner._get_feature_positions(mm_positions, prefill_start_index, prefill_end_index)
+        self.assertEqual(len(result), 3)
+
+        # First position (overlapping start)
+        self.assertEqual(result[0].offset, 2)
+        self.assertEqual(result[0].length, 3)
+
+        # Second position (completely within)
+        self.assertEqual(result[1].offset, 0)
+        self.assertEqual(result[1].length, 6)
+
+        # Third position (overlapping end)
+        self.assertEqual(result[2].offset, 0)
+        self.assertEqual(result[2].length, 1)
+
+    def test_zero_length_range(self):
+        """Test with zero-length prefill range"""
+        mm_positions = [
+            ImagePosition(offset=10, length=5),
+        ]
+        prefill_start_index = 15
+        prefill_end_index = 15  # Zero-length range
+
+        result = self.runner._get_feature_positions(mm_positions, prefill_start_index, prefill_end_index)
+
+        self.assertEqual(len(result), 0)
+
+    def test_empty_positions_list(self):
+        """Test with an empty positions list"""
+        mm_positions = []
+        prefill_start_index = 10
+        prefill_end_index = 20
+
+        result = self.runner._get_feature_positions(mm_positions, prefill_start_index, prefill_end_index)
+
+        self.assertEqual(len(result), 0)
+
+    def test_identical_positions_copy(self):
+        """Test that positions within range are correctly deep copied"""
+        mm_positions = [
+            ImagePosition(offset=12, length=5),
+        ]
+        prefill_start_index = 10
+        prefill_end_index = 20
+
+        result = self.runner._get_feature_positions(mm_positions, prefill_start_index, prefill_end_index)
+
+        self.assertEqual(len(result), 1)
+        # Verify it's a copy, not the same object
+        self.assertIsNot(result[0], mm_positions[0])
+        # But has the same values
+        self.assertEqual(result[0].offset, 0)
+        self.assertEqual(result[0].length, 5)
+
+
+class TestProcessMMFeatures(unittest.TestCase):
+
+    def setUp(self):
+        # Create a mock GPUModelRunner instance for testing
+        self.mock_fd_config = Mock()
+        self.mock_model_config = Mock()
+        self.mock_model_config.enable_mm = True
+        self.mock_model_config.model_type = "qwen"
+        self.mock_fd_config.model_config = self.mock_model_config
+
+        # Mock other necessary configurations
+        self.mock_fd_config.scheduler_config = Mock()
+        self.mock_fd_config.scheduler_config.max_num_seqs = 10
+        self.mock_fd_config.parallel_config = Mock()
+        self.mock_fd_config.parallel_config.tensor_parallel_size = 1
+
+        self.runner = GPUModelRunner.__new__(GPUModelRunner)
+        self.runner.fd_config = self.mock_fd_config
+        self.runner.model_config = self.mock_model_config
+        self.runner.scheduler_config = self.mock_fd_config.scheduler_config
+        self.runner.enable_mm = True
+        self.runner.is_pooling_model = False
+        self.runner.encoder_cache = {}
+        self.runner.share_inputs = InputBatch(self.mock_fd_config)
+        self.runner.share_inputs.image_features = None
+        self.runner.share_inputs.image_features_list = None
+        self.runner.share_inputs.rope_emb = paddle.full(shape=[2, 1], fill_value=0, dtype="float32")
+        self.runner.extract_vision_features = Mock()
+        self.runner.prepare_rope3d = Mock()
+
+    def _create_mock_request(self, with_image=False, task_type_value=0, **kwargs):
+        """Helper method to create mock requests"""
+        request = Mock()
+        request.task_type.value = task_type_value
+        request.idx = kwargs.get("idx", 0)
+        request.request_id = kwargs.get("request_id", "test_req")
+        request.with_image = with_image
+        request.prefill_start_index = kwargs.get("prefill_start_index", 0)
+        request.prefill_end_index = kwargs.get("prefill_end_index", 10)
+        request.num_image_start = kwargs.get("num_image_start", 0)
+        request.num_image_end = kwargs.get("num_image_end", 0)
+        request.image_start = kwargs.get("image_start", 0)
+        request.image_end = kwargs.get("image_end", 0)
+
+        # Setup multimodal_inputs
+        request.multimodal_inputs = {
+            "position_ids": kwargs.get("position_ids", np.array([[1, 2, 3]])),
+        }
+
+        if with_image:
+            request.multimodal_inputs.update(
+                {
+                    "images": kwargs.get("images", []),
+                    "grid_thw": kwargs.get("grid_thw", []),
+                    "mm_positions": kwargs.get("mm_positions", []),
+                    "mm_hashes": kwargs.get("mm_hashes", []),
+                    "vit_seqlen": kwargs.get("vit_seqlen", []),
+                    "vit_position_ids": kwargs.get("vit_position_ids", []),
+                    "mm_num_token_func": lambda **kwargs: 123,
+                }
+            )
+
+        # Add get method for evict_mm_hashes
+        request.get = Mock(side_effect=lambda key, default=None: kwargs.get(key, default))
+
+        return request
+
+    def test_process_mm_features_no_mm_enabled(self):
+        """Test when multimodal is not enabled"""
+        self.runner.enable_mm = False
+        request_list = [self._create_mock_request()]
+
+        self.runner._process_mm_features(request_list)
+
+        # Should return early without processing
+
+        self.assertIsNone(self.runner.share_inputs["image_features_list"])
+
+    def test_process_mm_features_no_prefill_requests(self):
+        """Test when there are no prefill requests"""
+        request_list = [
+            self._create_mock_request(task_type_value=1),  # Not prefill
+            self._create_mock_request(task_type_value=2),  # Not prefill
+        ]
+
+        # Mock prepare_rope3d to return list of rope embeddings
+        self.runner.prepare_rope3d.return_value = [1, 2]
+        self.runner._process_mm_features(request_list)
+
+        # Should not process any requests
+        self.assertFalse(
+            any(isinstance(t, paddle.Tensor) for t in self.runner.share_inputs["image_features_list"]),
+        )
+
+    def test_process_mm_features_evict_cache(self):
+        """Test eviction of multimodal cache"""
+        # Pre-populate cache
+        self.runner.encoder_cache["hash1"] = "cached_feature1"
+        self.runner.encoder_cache["hash2"] = "cached_feature2"
+
+        request_list = [self._create_mock_request(task_type_value=0, evict_mm_hashes=["hash1"])]
+
+        # Mock prepare_rope3d to return list of rope embeddings
+        self.runner.prepare_rope3d.return_value = [1, 2]
+        self.runner._process_mm_features(request_list)
+
+        # Check that hash1 was evicted but hash2 remains
+        self.assertNotIn("hash1", self.runner.encoder_cache)
+        self.assertIn("hash2", self.runner.encoder_cache)
+
+    def test_process_mm_features_with_image_no_cache(self):
+        """Test processing images without cache"""
+        # Mock image features output
+        self.runner.extract_vision_features.return_value = paddle.full(shape=[2, 1], fill_value=0, dtype="float32")
+
+        # Setup grid_thw to return a value for paddle.prod
+        grid_thw = [np.array([1, 4, 4])]  # prod will be 16, //4 = 4
+
+        request_list = [
+            self._create_mock_request(
+                task_type_value=0,
+                with_image=True,
+                idx=0,
+                num_image_start=0,
+                num_image_end=1,
+                grid_thw=grid_thw,
+                mm_hashes=["new_hash"],
+                mm_positions=[Mock(offset=0, length=4)],
+                images=[1] * 16,  # 16 image tokens
+                vit_seqlen=[4],
+                vit_position_ids=[[0, 1, 2, 3]],
+            )
+        ]
+
+        # Mock prepare_rope3d to return list of rope embeddings
+        self.runner.prepare_rope3d.return_value = [1, 2]
+        self.runner._process_mm_features(request_list)
+
+        # Verify extract_vision_features was called
+        self.runner.extract_vision_features.assert_called_once()
+
+        # Verify cache was populated
+        self.assertIn("new_hash", self.runner.encoder_cache)
+
+        # Verify image features were set
+        self.assertTrue(
+            any(isinstance(t, paddle.Tensor) for t in self.runner.share_inputs["image_features_list"]),
+        )
+
+    def test_process_mm_features_with_cache_hit(self):
+        """Test processing images with cache hit"""
+        import numpy as np
+
+        # Pre-populate cache
+        cached_feature = Mock()
+        cached_feature.cuda = paddle.full(shape=[2, 1], fill_value=0, dtype="float32")
+        self.runner.encoder_cache["cached_hash"] = cached_feature
+
+        # Mock image features output (should not be used due to cache hit)
+        mock_features = Mock()
+        self.runner.extract_vision_features.return_value = mock_features
+
+        grid_thw = [np.array([1, 4, 4])]
+
+        request_list = [
+            self._create_mock_request(
+                task_type_value=0,
+                with_image=True,
+                idx=0,
+                num_image_start=0,
+                num_image_end=1,
+                grid_thw=grid_thw,
+                mm_hashes=["cached_hash"],
+                mm_positions=[Mock(offset=0, length=4)],
+                images=[1] * 16,
+                vit_seqlen=[4],
+                vit_position_ids=[[0, 1, 2, 3]],
+            )
+        ]
+
+        # Mock prepare_rope3d to return list of rope embeddings
+        self.runner.prepare_rope3d.return_value = [1, 2]
+        self.runner._process_mm_features(request_list)
+
+        # Verify extract_vision_features was NOT called (cache hit)
+        self.runner.extract_vision_features.assert_not_called()
+
+        # Verify image features were set using cached feature
+        self.assertTrue(
+            any(isinstance(t, paddle.Tensor) for t in self.runner.share_inputs["image_features_list"]),
+        )
+
+    def test_process_mm_features_mixed_cache(self):
+        """Test processing with mixed cache hit and miss"""
+        import numpy as np
+
+        # Pre-populate one cache entry
+        cached_feature = Mock()
+        cached_feature.cuda = paddle.full(shape=[2, 1], fill_value=0, dtype="float32")
+        self.runner.encoder_cache["hash1"] = cached_feature
+
+        self.runner.extract_vision_features.return_value = paddle.full(shape=[2, 1], fill_value=0, dtype="float32")
+        grid_thw = [np.array([1, 4, 4]), np.array([1, 4, 4])]
+
+        request_list = [
+            self._create_mock_request(
+                task_type_value=0,
+                with_image=True,
+                idx=0,
+                num_image_start=0,
+                num_image_end=2,
+                grid_thw=grid_thw,
+                mm_hashes=["hash1", "hash2"],  # hash1 in cache, hash2 not
+                mm_positions=[Mock(offset=0, length=4), Mock(offset=4, length=4)],
+                images=[1] * 32,  # 2 images, 16 tokens each
+                vit_seqlen=[4, 4],
+                vit_position_ids=[[0, 1, 2, 3], [4, 5, 6, 7]],
+            )
+        ]
+
+        # Mock prepare_rope3d to return list of rope embeddings
+        self.runner.prepare_rope3d.return_value = [1, 2]
+        self.runner._process_mm_features(request_list)
+
+        # Verify extract_vision_features was called (for hash2)
+        self.runner.extract_vision_features.assert_called_once()
+
+        # Verify both hashes are now in cache
+        self.assertIn("hash1", self.runner.encoder_cache)
+        self.assertIn("hash2", self.runner.encoder_cache)
+
+        # Verify image features were set
+        self.assertTrue(
+            any(isinstance(t, paddle.Tensor) for t in self.runner.share_inputs["image_features_list"]),
+        )
+
+    def test_process_mm_features_no_encoder_cache(self):
+        """Test processing without encoder cache"""
+        import numpy as np
+
+        self.runner.encoder_cache = None
+
+        # Mock image features output
+        self.runner.extract_vision_features.return_value = paddle.full(shape=[2, 1], fill_value=0, dtype="float32")
+        grid_thw = [np.array([1, 4, 4])]
+
+        request_list = [
+            self._create_mock_request(
+                task_type_value=0,
+                with_image=True,
+                idx=0,
+                image_start=0,
+                image_end=16,
+                num_image_start=0,
+                num_image_end=1,
+                grid_thw=grid_thw,
+                mm_positions=[Mock(offset=0, length=4)],
+                images=[1] * 16,
+                vit_seqlen=[4],
+                vit_position_ids=[[0, 1, 2, 3]],
+            )
+        ]
+
+        # Mock prepare_rope3d to return list of rope embeddings
+        self.runner.prepare_rope3d.return_value = [1, 2]
+        self.runner._process_mm_features(request_list)
+
+        # Verify extract_vision_features was called
+        self.runner.extract_vision_features.assert_called_once()
+
+        # Verify image features were set
+        self.assertTrue(
+            any(isinstance(t, paddle.Tensor) for t in self.runner.share_inputs["image_features_list"]),
+        )
+
+
+class TestSleepWakeupBehavior(unittest.TestCase):
+    def _make_runner(self):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.is_weight_sleeping = False
+        runner.is_kvcache_sleeping = False
+        runner.use_cudagraph = False
+        runner.spec_method = None
+        runner.local_rank = 0
+        runner.device_id = 1
+        runner.num_gpu_blocks = 8
+        runner.model = Mock(clear_graph_opt_backend=Mock())
+        runner.clear_cache = Mock()
+        runner.initialize_kv_cache = Mock()
+        runner.capture_model = Mock()
+        runner.share_inputs = Mock(reset_share_inputs=Mock())
+        runner.dynamic_weight_manager = Mock(
+            clear_deepep_buffer=Mock(),
+            clear_model_weight=Mock(),
+            clear_communication_group=Mock(),
+            restart_communication_group=Mock(),
+            recreate_deepep_buffer=Mock(),
+            reload_model_weights=Mock(),
+        )
+        runner.fd_config = Mock()
+        runner.fd_config.parallel_config = Mock(
+            enable_expert_parallel=False,
+            shutdown_comm_group_if_worker_idle=False,
+        )
+        runner.proposer = Mock(
+            clear_mtp_cache=Mock(),
+            initialize_kv_cache=Mock(),
+            model_inputs=Mock(reset_model_inputs=Mock()),
+        )
+        runner.enable_cache_manager_v1 = False
+        return runner
+
+    @patch("fastdeploy.worker.gpu_model_runner.print_gpu_memory_use")
+    @patch("paddle.device.cuda.empty_cache")
+    def test_sleep_offloads_weight_and_cache(self, mock_empty_cache, mock_print_memory):
+        runner = self._make_runner()
+        runner.use_cudagraph = True
+        runner.spec_method = SpecMethod.MTP
+        runner.fd_config.parallel_config.enable_expert_parallel = True
+        runner.fd_config.parallel_config.shutdown_comm_group_if_worker_idle = True
+
+        runner.sleep("weight,kv_cache")
+
+        runner.model.clear_graph_opt_backend.assert_called_once()
+        runner.dynamic_weight_manager.clear_deepep_buffer.assert_called_once()
+        runner.dynamic_weight_manager.clear_model_weight.assert_called_once()
+        runner.dynamic_weight_manager.clear_communication_group.assert_called_once()
+        runner.proposer.clear_mtp_cache.assert_called_once()
+        runner.clear_cache.assert_called_once()
+        self.assertTrue(runner.is_weight_sleeping)
+        self.assertTrue(runner.is_kvcache_sleeping)
+        mock_empty_cache.assert_called_once()
+        mock_print_memory.assert_called_once()
+
+    @patch("fastdeploy.worker.gpu_model_runner.print_gpu_memory_use")
+    @patch("paddle.device.cuda.empty_cache")
+    def test_sleep_weight_is_idempotent(self, mock_empty_cache, mock_print_memory):
+        runner = self._make_runner()
+        runner.is_weight_sleeping = True
+
+        runner.sleep("weight")
+
+        runner.dynamic_weight_manager.clear_model_weight.assert_not_called()
+        runner.clear_cache.assert_not_called()
+        mock_empty_cache.assert_not_called()
+        mock_print_memory.assert_not_called()
+
+    def test_wakeup_rejects_weight_only_when_cudagraph_requires_kvcache(self):
+        runner = self._make_runner()
+        runner.use_cudagraph = True
+        runner.is_kvcache_sleeping = True
+
+        with self.assertRaises(RuntimeError):
+            runner.wakeup("weight")
+
+    @patch("fastdeploy.worker.gpu_model_runner.print_gpu_memory_use")
+    def test_wakeup_restores_weight_and_cache(self, mock_print_memory):
+        runner = self._make_runner()
+        runner.use_cudagraph = True
+        runner.spec_method = SpecMethod.MTP
+        runner.is_weight_sleeping = True
+        runner.is_kvcache_sleeping = True
+        runner.fd_config.parallel_config.enable_expert_parallel = True
+        runner.fd_config.parallel_config.shutdown_comm_group_if_worker_idle = True
+
+        runner.wakeup("weight,kv_cache")
+
+        runner.proposer.model_inputs.reset_model_inputs.assert_called_once()
+        runner.share_inputs.reset_share_inputs.assert_called_once()
+        runner.proposer.initialize_kv_cache.assert_called_once_with(main_model_num_blocks=runner.num_gpu_blocks)
+        runner.initialize_kv_cache.assert_called_once()
+        runner.dynamic_weight_manager.restart_communication_group.assert_called_once()
+        runner.dynamic_weight_manager.recreate_deepep_buffer.assert_called_once()
+        runner.dynamic_weight_manager.reload_model_weights.assert_called_once()
+        runner.capture_model.assert_called_once()
+        self.assertFalse(runner.is_weight_sleeping)
+        self.assertFalse(runner.is_kvcache_sleeping)
+        mock_print_memory.assert_called_once()
+
+    @patch("fastdeploy.worker.gpu_model_runner.print_gpu_memory_use")
+    def test_wakeup_kvcache_is_idempotent(self, mock_print_memory):
+        runner = self._make_runner()
+        runner.is_kvcache_sleeping = False
+
+        runner.wakeup("kv_cache")
+
+        runner.initialize_kv_cache.assert_not_called()
+        runner.dynamic_weight_manager.reload_model_weights.assert_not_called()
+        mock_print_memory.assert_not_called()
+
+
+def _sync_async_set_value(tgt, src):
+    """Synchronous stand-in for async_set_value used in tests (no CUDA required).
+
+    Writes to real numpy arrays; silently skips Mock objects (untracked share_inputs
+    fields whose values we do not assert on).
+    """
+    from unittest.mock import MagicMock
+
+    import numpy as np
+
+    if isinstance(tgt, MagicMock):
+        return  # untracked field — nothing to write
+    if isinstance(src, (int, float, bool)):
+        tgt[:] = src
+    elif isinstance(src, (list, np.ndarray)):
+        tgt[:] = np.array(src).reshape(tgt.shape)
+    elif hasattr(src, "numpy"):
+        tgt[:] = src.numpy()
+    else:
+        tgt[:] = src
+
+
+class TestInsertTasksV1SplitwiseSuffix(unittest.TestCase):
+    """Tests that SpecMethod.SUFFIX + PD separation is rejected at config level."""
+
+    def test_suffix_pd_decode_rejected_at_config_level(self):
+        """suffix + splitwise_role='decode' raises ValueError in EngineArgs."""
+        from fastdeploy.engine.args_utils import EngineArgs
+
+        with self.assertRaises(ValueError) as ctx:
+            EngineArgs(
+                model="/tmp/fake",
+                splitwise_role="decode",
+                speculative_config={"method": "suffix", "num_speculative_tokens": 3},
+            )
+        self.assertIn("SUFFIX does not support PD", str(ctx.exception))
+
+    def test_suffix_pd_prefill_rejected_at_config_level(self):
+        """suffix + splitwise_role='prefill' also raises ValueError."""
+        from fastdeploy.engine.args_utils import EngineArgs
+
+        with self.assertRaises(ValueError) as ctx:
+            EngineArgs(
+                model="/tmp/fake",
+                splitwise_role="prefill",
+                speculative_config={"method": "suffix", "num_speculative_tokens": 3},
+            )
+        self.assertIn("SUFFIX does not support PD", str(ctx.exception))
+
+    def test_suffix_mixed_mode_allowed(self):
+        """suffix + splitwise_role='mixed' does NOT raise."""
+        from fastdeploy.engine.args_utils import EngineArgs
+
+        try:
+            EngineArgs(
+                model="/tmp/fake",
+                splitwise_role="mixed",
+                speculative_config={"method": "suffix", "num_speculative_tokens": 3},
+            )
+        except ValueError as e:
+            if "SUFFIX" in str(e):
+                self.fail(f"suffix+mixed should be allowed, but got: {e}")
+
+
+class TestInsertTasksV1SplitwiseNaive(unittest.TestCase):
+    """Tests for insert_tasks_v1 splitwise_role='decode' + SpecMethod.NAIVE branch."""
+
+    def _make_share_inputs(self, bsz=4, max_draft=6):
+        """Mock-backed share_inputs; only keys we assert on hold real numpy arrays."""
+        import numpy as np
+
+        tracked = {
+            "seq_lens_encoder": np.zeros((bsz, 1), dtype=np.int32),
+            "draft_tokens": np.zeros((bsz, max_draft), dtype=np.int64),
+            "seq_lens_this_time_buffer": np.zeros((bsz, 1), dtype=np.int32),
+            "req_ids": [""] * bsz,
+            "preempted_idx": np.zeros((bsz, 1), dtype=np.int32),
+            "num_running_requests": 0,
+            "running_requests_ids": [],
+        }
+
+        class _SI:
+            def get_index_by_batch_id(self, batch_id):
+                return batch_id
+
+            def __getitem__(self, key):
+                if key in tracked:
+                    return tracked[key]
+                return MagicMock()
+
+            def __setitem__(self, key, value):
+                tracked[key] = value
+
+        return _SI()
+
+    def _make_runner(self, bsz=4, num_spec_tokens=3):
+        from unittest.mock import Mock
+
+        from fastdeploy.spec_decode import SpecMethod
+        from fastdeploy.worker.gpu_model_runner import GPUModelRunner
+
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.enable_mm = False
+        runner.is_pooling_model = False
+        runner.speculative_decoding = True
+        runner.spec_method = SpecMethod.NAIVE
+        runner.speculative_config = Mock(num_speculative_tokens=num_spec_tokens)
+        runner.deterministic_logger = None
+        runner.routing_replay_manager = Mock()
+        runner.prompt_logprobs_reqs = {}
+        runner.in_progress_prompt_logprobs = {}
+        runner.forward_batch_reqs_list = [None] * bsz
+        runner._cached_launch_token_num = -1
+        runner._cached_real_bsz = 0
+        runner.exist_prefill_flag = True
+        runner.proposer = Mock()
+        runner.sampler = Mock()
+        runner.model_config = Mock(eos_tokens_lens=1)
+        runner.share_inputs = self._make_share_inputs(bsz=bsz, max_draft=num_spec_tokens + 2)
+
+        fd_config = Mock()
+        fd_config.scheduler_config.splitwise_role = "decode"
+        fd_config.routing_replay_config.enable_routing_replay = False
+        runner.fd_config = fd_config
+        runner.scheduler_config = fd_config.scheduler_config
+        runner.enable_cache_manager_v1 = False
+        return runner
+
+    def _make_prefill_request(self, idx, draft_token_ids):
+        from unittest.mock import Mock
+
+        from fastdeploy.engine.request import RequestType
+
+        req = Mock()
+        req.task_type = Mock(value=RequestType.PREFILL.value)
+        req.idx = idx
+        req.request_id = f"req_{idx}"
+        req.prompt_token_ids = [10, 20, 30]
+        req.output_token_ids = [99]
+        req.draft_token_ids = draft_token_ids
+        req.pooling_params = None
+        req.guided_json = None
+        req.guided_regex = None
+        req.structural_tag = None
+        req.guided_grammar = None
+        req.prefill_start_index = 0
+        req.prefill_end_index = 3
+        req.multimodal_inputs = None
+        req.get = Mock(return_value=None)
+        req.eos_token_ids = [2]
+        req.block_tables = []
+        return req
+
+    @patch("fastdeploy.worker.gpu_model_runner.async_set_value", side_effect=_sync_async_set_value)
+    def test_draft_token_single_token_written(self, _mock_asv):
+        """NAIVE: draft_tokens[0] gets first draft token, seq_lens_this_time_buffer=1."""
+        runner = self._make_runner(num_spec_tokens=3)
+        req = self._make_prefill_request(idx=0, draft_token_ids=[101, 202, 303])
+        runner.insert_tasks_v1([req], num_running_requests=1)
+
+        self.assertEqual(runner.share_inputs["draft_tokens"][0, 0], 101)
+        self.assertEqual(runner.share_inputs["seq_lens_this_time_buffer"][0, 0], 1)
+
+    @patch("fastdeploy.worker.gpu_model_runner.async_set_value", side_effect=_sync_async_set_value)
+    def test_exist_prefill_flag_cleared(self, _mock_asv):
+        runner = self._make_runner()
+        req = self._make_prefill_request(idx=0, draft_token_ids=[1, 2, 3])
+        runner.insert_tasks_v1([req], num_running_requests=1)
+        self.assertFalse(runner.exist_prefill_flag)
+
+    @patch("fastdeploy.worker.gpu_model_runner.async_set_value", side_effect=_sync_async_set_value)
+    def test_cached_launch_token_num_incremented_with_num_spec_tokens(self, _mock_asv):
+        runner = self._make_runner(num_spec_tokens=3)
+        runner._cached_launch_token_num = 10
+        runner._cached_real_bsz = 2
+        req = self._make_prefill_request(idx=0, draft_token_ids=[1, 2, 3])
+        runner.insert_tasks_v1([req], num_running_requests=1)
+        # token_num_one_step = num_speculative_tokens + 1 = 4
+        self.assertEqual(runner._cached_launch_token_num, 14)
+        self.assertEqual(runner._cached_real_bsz, 3)
+
+    @patch("fastdeploy.worker.gpu_model_runner.async_set_value", side_effect=_sync_async_set_value)
+    def test_cached_launch_token_num_skipped_when_negative_one(self, _mock_asv):
+        runner = self._make_runner(num_spec_tokens=3)
+        runner._cached_launch_token_num = -1
+        req = self._make_prefill_request(idx=0, draft_token_ids=[1, 2, 3])
+        runner.insert_tasks_v1([req], num_running_requests=1)
+        self.assertEqual(runner._cached_launch_token_num, -1)
+
+
+class TestInsertTasksV1SplitwiseMTP(unittest.TestCase):
+    """Tests for insert_tasks_v1 splitwise_role='decode' + SpecMethod.MTP branch."""
+
+    def _make_share_inputs(self, bsz=4, max_draft=6):
+        import numpy as np
+
+        tracked = {
+            "seq_lens_encoder": np.zeros((bsz, 1), dtype=np.int32),
+            "draft_tokens": np.zeros((bsz, max_draft), dtype=np.int64),
+            "seq_lens_this_time_buffer": np.zeros((bsz, 1), dtype=np.int32),
+            "req_ids": [""] * bsz,
+            "preempted_idx": np.zeros((bsz, 1), dtype=np.int32),
+            "num_running_requests": 0,
+            "running_requests_ids": [],
+        }
+
+        class _SI:
+            index_to_batch_id = {i: i for i in range(bsz)}
+
+            def get_index_by_batch_id(self, batch_id):
+                return batch_id
+
+            def __getitem__(self, key):
+                if key in tracked:
+                    return tracked[key]
+                return MagicMock()
+
+            def __setitem__(self, key, value):
+                tracked[key] = value
+
+        return _SI()
+
+    def _make_runner(self, bsz=4, num_spec_tokens=3):
+        from unittest.mock import Mock
+
+        from fastdeploy.spec_decode import SpecMethod
+        from fastdeploy.worker.gpu_model_runner import GPUModelRunner
+
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.enable_mm = False
+        runner.is_pooling_model = False
+        runner.speculative_decoding = True
+        runner.spec_method = SpecMethod.MTP
+        runner.speculative_config = Mock(num_speculative_tokens=num_spec_tokens)
+        runner.deterministic_logger = None
+        runner.routing_replay_manager = Mock()
+        runner.prompt_logprobs_reqs = {}
+        runner.in_progress_prompt_logprobs = {}
+        runner.forward_batch_reqs_list = [None] * bsz
+        runner._cached_launch_token_num = -1
+        runner._cached_real_bsz = 0
+        runner.exist_prefill_flag = True
+        runner.proposer = Mock()
+        runner.sampler = Mock()
+        runner.model_config = Mock(eos_tokens_lens=1)
+        runner.share_inputs = self._make_share_inputs(bsz=bsz, max_draft=num_spec_tokens + 2)
+
+        fd_config = Mock()
+        fd_config.scheduler_config.splitwise_role = "decode"
+        fd_config.routing_replay_config.enable_routing_replay = False
+        runner.fd_config = fd_config
+        runner.scheduler_config = fd_config.scheduler_config
+        runner.enable_cache_manager_v1 = False
+        return runner
+
+    def _make_prefill_request(self, idx, draft_token_ids):
+        from unittest.mock import Mock
+
+        from fastdeploy.engine.request import RequestType
+
+        req = Mock()
+        req.task_type = Mock(value=RequestType.PREFILL.value)
+        req.idx = idx
+        req.request_id = f"req_{idx}"
+        req.prompt_token_ids = [10, 20, 30]
+        req.output_token_ids = [99]
+        req.draft_token_ids = draft_token_ids
+        req.pooling_params = None
+        req.guided_json = None
+        req.guided_regex = None
+        req.structural_tag = None
+        req.guided_grammar = None
+        req.prefill_start_index = 0
+        req.prefill_end_index = 3
+        req.multimodal_inputs = None
+        req.get = Mock(return_value=None)
+        req.eos_token_ids = [2]
+        req.block_tables = []
+        return req
+
+    @patch("fastdeploy.worker.gpu_model_runner.async_set_value", side_effect=_sync_async_set_value)
+    def test_mtp_draft_tokens_written(self, _mock_asv):
+        """MTP: draft_tokens[0:2] gets first two draft tokens, seq_lens_this_time_buffer=2."""
+        runner = self._make_runner(num_spec_tokens=3)
+        req = self._make_prefill_request(idx=0, draft_token_ids=[101, 202, 303])
+        runner.insert_tasks_v1([req], num_running_requests=1)
+
+        self.assertEqual(runner.share_inputs["draft_tokens"][0, 0], 101)
+        self.assertEqual(runner.share_inputs["draft_tokens"][0, 1], 202)
+        self.assertEqual(runner.share_inputs["seq_lens_this_time_buffer"][0, 0], 2)
+
+    @patch("fastdeploy.worker.gpu_model_runner.async_set_value", side_effect=_sync_async_set_value)
+    def test_mtp_raises_on_insufficient_draft_tokens(self, _mock_asv):
+        """MTP: raises ValueError when less than 2 draft tokens provided."""
+        runner = self._make_runner(num_spec_tokens=3)
+        req = self._make_prefill_request(idx=0, draft_token_ids=[101])
+        with self.assertRaises(ValueError) as ctx:
+            runner.insert_tasks_v1([req], num_running_requests=1)
+        self.assertIn("Expected at least 2 draft tokens", str(ctx.exception))
+
+
+class TestMakePreemptedBatchOutput(unittest.TestCase):
+    def _make_runner(self, speculative_decoding=False, enable_logprob=False):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.speculative_decoding = speculative_decoding
+        runner.enable_logprob = enable_logprob
+        runner.parallel_config = Mock(msg_queue_id=0, tensor_parallel_rank=0, use_ep=False)
+
+        class _ShareInputs(dict):
+            enable_pd_reorder = False
+
+        share_inputs = _ShareInputs()
+        share_inputs["preempted_idx"] = paddle.to_tensor(
+            [[0], [0], [0], [1], [0], [0], [1], [0], [0], [0]], dtype="int32"
+        )
+        share_inputs["sampled_token_ids"] = paddle.zeros([10, 1], dtype="int64")
+        share_inputs["index_to_batch_id"] = {i: i for i in range(10)}
+        share_inputs["next_tokens"] = paddle.zeros([10, 1], dtype="int64")
+        share_inputs["stop_flags"] = paddle.zeros([10, 1], dtype="bool")
+        share_inputs["step_idx"] = 0
+        share_inputs["max_dec_len"] = 16
+        share_inputs["seq_lens_this_time"] = paddle.zeros([10, 1], dtype="int32")
+        share_inputs["eos_token_id"] = paddle.zeros([1], dtype="int64")
+        share_inputs["not_need_stop"] = False
+        share_inputs["not_need_stop_device"] = paddle.zeros([1], dtype="bool")
+        share_inputs["input_ids"] = paddle.zeros([10, 1], dtype="int64")
+        share_inputs["seq_lens_encoder"] = paddle.zeros([10, 1], dtype="int32")
+        share_inputs["seq_lens_decoder"] = paddle.zeros([10, 1], dtype="int32")
+        share_inputs["is_block_step"] = paddle.zeros([10, 1], dtype="bool")
+        share_inputs["token_ids_all"] = paddle.zeros([10, 1], dtype="int64")
+        share_inputs["stop_seqs"] = paddle.zeros([10, 1], dtype="int64")
+        share_inputs["stop_seqs_len"] = paddle.zeros([10, 1], dtype="int32")
+        share_inputs["min_dec_len"] = paddle.zeros([10, 1], dtype="int64")
+        share_inputs["prompt_lens"] = paddle.zeros([10, 1], dtype="int32")
+        share_inputs["mask_rollback"] = paddle.zeros([10, 1], dtype="bool")
+        share_inputs["accept_tokens_cpu"] = paddle.full([10, 1], fill_value=-1, dtype="int64")
+        share_inputs["accept_num_cpu"] = paddle.full([10, 1], fill_value=-1, dtype="int32")
+        share_inputs["seq_lens_decoder_cpu"] = paddle.full([10, 1], fill_value=-1, dtype="int32")
+        share_inputs["prompt_lens_cpu"] = paddle.full([10, 1], fill_value=-1, dtype="int32")
+        share_inputs["draft_tokens"] = paddle.zeros([10, 1], dtype="int64")
+        share_inputs["actual_draft_token_num"] = paddle.zeros([10, 1], dtype="int32")
+        share_inputs["accept_tokens"] = paddle.zeros([10, 1], dtype="int64")
+        share_inputs["accept_num"] = paddle.zeros([10, 1], dtype="int32")
+        runner.share_inputs = share_inputs
+        return runner
+
+    def test_make_preempted_batch_output_emits_sparse_preempt_mask(self):
+        runner = self._make_runner()
+
+        model_output_data, sampler_output = runner._make_preempted_batch_output()
+
+        expected = [-1, -1, -1, PREEMPTED_TOKEN_ID, -1, -1, PREEMPTED_TOKEN_ID]
+        self.assertEqual(sampler_output.sampled_token_ids.shape, [7, 1])
+        self.assertEqual(sampler_output.sampled_token_ids.numpy().reshape([-1]).tolist(), expected)
+        self.assertEqual(runner.share_inputs["sampled_token_ids"][:7].numpy().reshape([-1]).tolist(), expected)
+        self.assertEqual(model_output_data.index_to_batch_id, {i: i for i in range(7)})
+
+    def test_make_preempted_batch_output_speculative_logprob(self):
+        runner = self._make_runner(speculative_decoding=True, enable_logprob=True)
+        runner.share_inputs["seq_lens_decoder"][:7] = paddle.arange(7, dtype="int32").reshape([7, 1])
+        runner.share_inputs["prompt_lens"][:7] = paddle.arange(10, 17, dtype="int32").reshape([7, 1])
+
+        model_output_data, sampler_output = runner._make_preempted_batch_output()
+
+        self.assertEqual(sampler_output.sampled_token_ids.shape, [7, 1])
+        self.assertIsNotNone(sampler_output.logprobs_tensors)
+        self.assertEqual(sampler_output.logprobs_tensors.logprob_token_ids.shape, [7, 1])
+        self.assertEqual(sampler_output.token_num_per_batch.shape, [7, 1])
+        self.assertEqual(sampler_output.cu_batch_token_offset.shape, [8])
+        self.assertEqual(runner.share_inputs["accept_tokens_cpu"][:7].numpy().reshape([-1]).tolist(), [0] * 7)
+        self.assertEqual(runner.share_inputs["accept_num_cpu"][:7].numpy().reshape([-1]).tolist(), [0] * 7)
+        self.assertEqual(
+            runner.share_inputs["seq_lens_decoder_cpu"][:7].numpy().reshape([-1]).tolist(),
+            list(range(7)),
+        )
+        self.assertEqual(
+            runner.share_inputs["prompt_lens_cpu"][:7].numpy().reshape([-1]).tolist(),
+            list(range(10, 17)),
+        )
+        self.assertIsNotNone(model_output_data.accept_tokens)
+        self.assertIsNotNone(model_output_data.accept_num)
+
+
+class TestExecuteModel(unittest.TestCase):
+    def _make_runner(self):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.speculative_decoding = False
+        runner.parallel_config = Mock(use_ep=False)
+        runner.fd_config = Mock()
+        runner.fd_config.speculative_config = Mock(method=None)
+        runner.proposer = Mock(model=Mock())
+        runner.forward_meta = Mock()
+        runner._save_model_output = Mock()
+        runner._make_preempted_batch_output = Mock(return_value=("model_output", "sampler_output"))
+        runner._postprocess = Mock()
+        runner._execute_empty_mtp_input = Mock()
+        runner._cached_launch_token_num = 0
+        runner._cached_real_bsz = 0
+
+        class _ShareInputs(dict):
+            pass
+
+        share_inputs = _ShareInputs()
+        share_inputs["seq_lens_this_time_cpu"] = paddle.zeros([2, 1], dtype="int32")
+        share_inputs["preempted_idx"] = paddle.to_tensor([[1], [0]], dtype="int32")
+        share_inputs["last_preempted_idx"] = paddle.zeros([2, 1], dtype="int32")
+        runner.share_inputs = share_inputs
+        return runner
+
+    def test_execute_model_dispatches_to_normal_path(self):
+        runner = self._make_runner()
+        runner.enable_overlap_schedule = False
+        runner.execute_model_normal = Mock()
+        runner.execute_model_overlap = Mock()
+
+        runner.execute_model(model_forward_batch=["req"], num_running_requests=1)
+
+        runner.execute_model_normal.assert_called_once_with(["req"], 1)
+        runner.execute_model_overlap.assert_not_called()
+
+    def test_execute_model_dispatches_to_overlap_path(self):
+        runner = self._make_runner()
+        runner.enable_overlap_schedule = True
+        runner.execute_model_normal = Mock()
+        runner.execute_model_overlap = Mock()
+
+        runner.execute_model(model_forward_batch=["req"], num_running_requests=1)
+
+        runner.execute_model_overlap.assert_called_once_with(["req"], 1)
+        runner.execute_model_normal.assert_not_called()
+
+    def test_execute_model_normal_zero_output_flushes_preempted_batch(self):
+        runner = self._make_runner()
+        runner._preprocess = Mock(return_value=("model_inputs", "done_idxs", None))
+        runner._execute = Mock(return_value=None)
+
+        runner.execute_model_normal()
+
+        runner._make_preempted_batch_output.assert_called_once_with()
+        np.testing.assert_array_equal(runner.share_inputs["last_preempted_idx"].numpy(), np.array([[1], [0]]))
+        np.testing.assert_array_equal(runner.share_inputs["preempted_idx"].numpy(), np.array([[0], [0]]))
+        runner._save_model_output.assert_called_once_with("model_output", "sampler_output")
+
+    def test_execute_model_normal_postprocess_saves_output_after_sync(self):
+        runner = self._make_runner()
+        runner.share_inputs["seq_lens_this_time_cpu"] = paddle.to_tensor([[1], [0]], dtype="int32")
+        runner._preprocess = Mock(return_value=("model_inputs", "done_idxs", None))
+        runner._execute = Mock(return_value="model_output")
+        post_process_event = Mock()
+        runner._postprocess.return_value = ("model_output_data", "sampler_output", post_process_event)
+
+        runner.execute_model_normal(model_forward_batch=["req"], num_running_requests=1)
+
+        runner._make_preempted_batch_output.assert_not_called()
+        post_process_event.synchronize.assert_called_once_with()
+        runner._save_model_output.assert_called_once_with("model_output_data", "sampler_output")
+
+    def test_execute_model_overlap_zero_output_flushes_preempted_batch(self):
+        runner = self._make_runner()
+        token_num_event = Mock()
+        runner._preprocess = Mock(return_value=("model_inputs", "done_idxs", token_num_event))
+        runner._execute = Mock(return_value=None)
+        runner._predict_next_launch_token_num = Mock(return_value=(11, 22))
+        runner._cached_model_output_data = None
+        runner._cached_sampler_output = "cached_sampler"
+        runner._cached_post_process_event = "cached_event"
+
+        runner.execute_model_overlap()
+
+        token_num_event.synchronize.assert_called_once_with()
+        runner._make_preempted_batch_output.assert_called_once_with()
+        np.testing.assert_array_equal(runner.share_inputs["last_preempted_idx"].numpy(), np.array([[1], [0]]))
+        np.testing.assert_array_equal(runner.share_inputs["preempted_idx"].numpy(), np.array([[0], [0]]))
+        runner._save_model_output.assert_called_once_with("model_output", "sampler_output")
+        self.assertIsNone(runner._cached_model_output_data)
+        self.assertIsNone(runner._cached_sampler_output)
+        self.assertIsNone(runner._cached_post_process_event)
+        self.assertEqual(runner._cached_launch_token_num, 11)
+        self.assertEqual(runner._cached_real_bsz, 22)
+
+
+class TestGetKvNumHeadsPerLayer(unittest.TestCase):
+    """Tests for GPUModelRunner._get_kv_num_heads_per_layer"""
+
+    def _make_runner(self, num_hidden_layers, num_key_value_heads, tp_size=1, **extra_attrs):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.model_config = Mock()
+        runner.model_config.num_hidden_layers = num_hidden_layers
+        runner.model_config.num_key_value_heads = num_key_value_heads
+        runner.model_config.num_key_value_heads_list = None
+        runner.parallel_config = Mock()
+        runner.parallel_config.tensor_parallel_size = tp_size
+        for k, v in extra_attrs.items():
+            setattr(runner.model_config, k, v)
+        return runner
+
+    def test_uniform_heads_no_swa(self):
+        """No SWA config -> uniform kv_num_heads across all layers"""
+        runner = self._make_runner(4, 8, tp_size=2, window_attn_skip_freq=None, swa_num_key_value_heads=None)
+        result = runner._get_kv_num_heads_per_layer()
+        self.assertEqual(result, [4, 4, 4, 4])
+
+    def test_uniform_heads_tp1(self):
+        """TP=1, no SWA"""
+        runner = self._make_runner(3, 6, tp_size=1, window_attn_skip_freq=None, swa_num_key_value_heads=None)
+        result = runner._get_kv_num_heads_per_layer()
+        self.assertEqual(result, [6, 6, 6])
+
+    def test_swa_basic(self):
+        """SWA layers get swa_kv_num_heads, non-SWA layers get normal kv_num_heads"""
+        runner = self._make_runner(
+            4,
+            8,
+            tp_size=1,
+            window_attn_skip_freq=[1, 0, 1, 0],
+            swa_num_key_value_heads=4,
+        )
+        result = runner._get_kv_num_heads_per_layer()
+        # layer 0: swa (skip_freq=1) -> 4, layer 1: normal -> 8,
+        # layer 2: swa -> 4, layer 3: normal -> 8
+        self.assertEqual(result, [4, 8, 4, 8])
+
+    def test_swa_with_tp(self):
+        """SWA with tensor parallelism divides both head counts"""
+        runner = self._make_runner(
+            4,
+            8,
+            tp_size=2,
+            window_attn_skip_freq=[1, 0, 0, 1],
+            swa_num_key_value_heads=4,
+        )
+        result = runner._get_kv_num_heads_per_layer()
+        # kv_num_heads = 8 // 2 = 4, swa_kv_num_heads = 4 // 2 = 2
+        self.assertEqual(result, [2, 4, 4, 2])
+
+    def test_swa_all_layers(self):
+        """All layers are SWA"""
+        runner = self._make_runner(
+            3,
+            8,
+            tp_size=1,
+            window_attn_skip_freq=[1, 1, 1],
+            swa_num_key_value_heads=2,
+        )
+        result = runner._get_kv_num_heads_per_layer()
+        self.assertEqual(result, [2, 2, 2])
+
+    def test_swa_skip_freq_shorter_than_layers(self):
+        """window_attn_skip_freq shorter than num_hidden_layers -> extra layers use normal heads"""
+        runner = self._make_runner(
+            5,
+            8,
+            tp_size=1,
+            window_attn_skip_freq=[1, 0, 1],
+            swa_num_key_value_heads=4,
+        )
+        result = runner._get_kv_num_heads_per_layer()
+        # i=0: swa(4), i=1: normal(8), i=2: swa(4), i=3: out of range->normal(8), i=4: normal(8)
+        self.assertEqual(result, [4, 8, 4, 8, 8])
+
+    def test_swa_only_window_attn_skip_freq_set(self):
+        """Only window_attn_skip_freq set, swa_num_key_value_heads is None -> no SWA logic"""
+        runner = self._make_runner(
+            3,
+            6,
+            tp_size=1,
+            window_attn_skip_freq=[1, 0, 1],
+            swa_num_key_value_heads=None,
+        )
+        result = runner._get_kv_num_heads_per_layer()
+        self.assertEqual(result, [6, 6, 6])
+
+    def test_swa_only_swa_num_kv_heads_set(self):
+        """Only swa_num_key_value_heads set, window_attn_skip_freq is None -> no SWA logic"""
+        runner = self._make_runner(
+            3,
+            6,
+            tp_size=1,
+            window_attn_skip_freq=None,
+            swa_num_key_value_heads=4,
+        )
+        result = runner._get_kv_num_heads_per_layer()
+        self.assertEqual(result, [6, 6, 6])
+
+    def test_swa_kv_heads_min_clamp(self):
+        """swa_num_key_value_heads // tp_size < 1 should clamp to 1"""
+        runner = self._make_runner(
+            2,
+            8,
+            tp_size=8,
+            window_attn_skip_freq=[1, 0],
+            swa_num_key_value_heads=2,
+        )
+        result = runner._get_kv_num_heads_per_layer()
+        # kv_num_heads = max(1, 8//8) = 1, swa_kv_num_heads = max(1, 2//8) = 1
+        self.assertEqual(result, [1, 1])
+
+    def test_num_key_value_heads_list(self):
+        """When num_key_value_heads_list is provided, use per-layer values"""
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.model_config = Mock()
+        runner.model_config.num_hidden_layers = 3
+        runner.model_config.num_key_value_heads_list = [8, 4, 16]
+        runner.parallel_config = Mock()
+        runner.parallel_config.tensor_parallel_size = 2
+        result = runner._get_kv_num_heads_per_layer()
+        self.assertEqual(result, [4, 2, 8])
+
+    def test_num_key_value_heads_list_mismatch_raises(self):
+        """Mismatched list length raises ValueError"""
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.model_config = Mock()
+        runner.model_config.num_hidden_layers = 3
+        runner.model_config.num_key_value_heads_list = [8, 4]
+        runner.parallel_config = Mock()
+        runner.parallel_config.tensor_parallel_size = 1
+        with self.assertRaises(ValueError):
+            runner._get_kv_num_heads_per_layer()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
+
 import copy
 from dataclasses import dataclass
-from typing import list
+from typing import List
 
 from typing_extensions import Self
 
@@ -25,22 +26,22 @@ class KVCacheSpec:
     """
     A base class for specifying the KV cache format of one layer.
     """
+
     # number of tokens in a block
     block_size: int
     # the memory size used by each block in bytes.
     block_memory_used: int
 
     @classmethod
-    def merge(cls, specs: list[Self]) -> Self:
+    def merge(cls, specs: List[Self]) -> Self:
         """
-        Merge a list of KVCacheSpec objects into a single KVCacheSpec object.
+        Merge a List of KVCacheSpec objects into a single KVCacheSpec object.
         """
-        # check list
+        # check List
         assert all(
-            (spec.block_size == specs[0].block_size
-             and spec.block_memory_used == specs[0].block_memory_used)
-            for spec in specs[1:]), (
-                "All layers in the model must share the same block_size.")
+            (spec.block_size == specs[0].block_size and spec.block_memory_used == specs[0].block_memory_used)
+            for spec in specs[1:]
+        ), "All layers in the model must share the same block_size."
 
         return copy.deepcopy(specs[0])
 
@@ -48,6 +49,7 @@ class KVCacheSpec:
 @dataclass
 class AttentionSpec(KVCacheSpec):
     """ """
+
     num_kv_heads: int
     head_size: int
     dtype: str

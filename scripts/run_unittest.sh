@@ -19,6 +19,7 @@ git config --global --add safe.directory /workspace1/FastDeploy
 
 python -m pip install --force-reinstall --pre paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/nightly/cu126/
 python -m pip install --upgrade --force-reinstall -r requirements/unittest/requirements.txt
+python -m pip install xgrammar==0.1.19 torch==2.6.0
 bash tools/build_wheel.sh
 
 
@@ -46,12 +47,12 @@ done <<< "$gpu_info"
 export CUDA_VISIBLE_DEVICES=${min_gpu}
 
 # 使用 find 命令查找 test 目录下的 .py 文件
-test_files=$(find test -type f -name "test*.py")
+test_files=$(find tests -type f -name "test*.py")
 
 # 遍历每个找到的测试文件
 for test_file in $test_files; do
     python $test_file
-    
+
     # 检查前一个命令的退出状态码
     if [ $? -ne 0 ]; then
         echo $test_file

@@ -17,180 +17,944 @@
 """
 metrics
 """
+import copy
+import json
 import os
-import shutil
-from typing import Set, TYPE_CHECKING
+from typing import Set
 
-from prometheus_client import Gauge, Histogram, multiprocess, CollectorRegistry, generate_latest
+from prometheus_client import (
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+    multiprocess,
+)
 from prometheus_client.registry import Collector
 
-from fastdeploy.metrics.work_metrics import work_process_metrics
-from fastdeploy.utils import api_server_logger
-
-if TYPE_CHECKING:
-    from prometheus_client import Gauge, Histogram
-
-
-def cleanup_prometheus_files(is_main):
-    """
-       Cleans and recreates the Prometheus multiprocess directory.
-
-       Depending on whether it's the main process or a worker, this function removes the corresponding
-       Prometheus multiprocess directory (/tmp/prom_main or /tmp/prom_worker) and recreates it as an empty directory.
-
-       Args:
-           is_main (bool): Indicates whether the current process is the main process.
-
-       Returns:
-           str: The path to the newly created Prometheus multiprocess directory.
-    """
-    PROM_DIR = "/tmp/prom_main" if is_main else "/tmp/prom_worker"
-    if os.path.exists(PROM_DIR):
-        shutil.rmtree(PROM_DIR)
-    os.makedirs(PROM_DIR, exist_ok=True)
-    return PROM_DIR
+from fastdeploy import envs
+from fastdeploy.metrics import build_1_2_5_buckets
+from fastdeploy.metrics.interface import MetricsManagerInterface
+from fastdeploy.metrics.prometheus_multiprocess_setup import (
+    setup_multiprocess_prometheus,
+)
+from fastdeploy.metrics.stats import ZMQMetricsStats
+from fastdeploy.spec_decode import SpecMethod
+from fastdeploy.utils import llm_logger
 
 
 class SimpleCollector(Collector):
     """
-        A custom Prometheus collector that filters out specific metrics by name.
+    A custom Prometheus collector that filters out specific metrics by name.
 
-        This collector wraps an existing registry and yields only those metrics
-        whose names are not in the specified exclusion set.
+    This collector wraps an existing registry and yields only those metrics
+    whose names are not in the specified exclusion set.
     """
 
     def __init__(self, base_registry, exclude_names: Set[str]):
         """
-            Initializes the SimpleCollector.
+        Initializes the SimpleCollector.
 
-            Args:
-                base_registry (CollectorRegistry): The source registry from which metrics are collected.
-                exclude_names (Set[str]): A set of metric names to exclude from collection.
+        Args:
+            base_registry (CollectorRegistry): The source registry from which metrics are collected.
+            exclude_names (Set[str]): A set of metric names to exclude from collection.
         """
         self.base_registry = base_registry
         self.exclude_names = exclude_names
 
     def collect(self):
         """
-                Collects and yields metrics not in the exclusion list.
+        Collects and yields metrics not in the exclusion list.
 
-                Yields:
-                    Metric: Prometheus Metric objects that are not excluded.
-                """
+        Yields:
+            Metric: Prometheus Metric objects that are not excluded.
+        """
         for metric in self.base_registry.collect():
-            if metric.name not in self.exclude_names:
+            if not any(metric.name.startswith(name) for name in self.exclude_names):
                 yield metric
 
 
-def get_filtered_metrics(exclude_names: Set[str], extra_register_func=None) -> str:
+def get_filtered_metrics() -> str:
     """
     Get the merged metric text (specified metric name removed)
-    :param exclude_names: metric.name set to be excluded
-    :param extra_register_func: optional, main process custom metric registration method
     :return: filtered metric text (str)
     """
+
     base_registry = CollectorRegistry()
-    multiprocess.MultiProcessCollector(base_registry)
 
-    filtered_registry = CollectorRegistry()
-    filtered_registry.register(SimpleCollector(base_registry, exclude_names))
+    # 判断是否多进程
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        # multiprocess 会将当前共享目录中的所有指标收集到base_registry中
+        multiprocess.MultiProcessCollector(base_registry)
 
-    if extra_register_func:
-        extra_register_func(filtered_registry)
+        filtered_registry = CollectorRegistry()
+        # 动态获取需要排除的 gauge 指标列表
+        exclude_labels = main_process_metrics.get_excluded_metrics()
+        # 注册一个新的collector，过滤gauge指标
+        filtered_registry.register(SimpleCollector(base_registry, exclude_labels))
 
-    return generate_latest(filtered_registry).decode("utf-8")
+        # 将gauge指标重新注册到filtered_registry中，从内存中读取
+        main_process_metrics.re_register_gauge(filtered_registry)
+        # 将speculative中的gauge指标也重新注册
+        main_process_metrics.re_register_speculative_gauge(filtered_registry)
+
+        return generate_latest(filtered_registry).decode("utf-8")
+
+    else:
+        # 非多进程直接注册所有指标，从内存中读取
+        main_process_metrics.register_all(base_registry)
+        return generate_latest(base_registry).decode("utf-8")
 
 
 REQUEST_LATENCY_BUCKETS = [
-    0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0,
-    40.0, 50.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0
+    0.3,
+    0.5,
+    0.8,
+    1.0,
+    1.5,
+    2.0,
+    2.5,
+    5.0,
+    10.0,
+    15.0,
+    20.0,
+    30.0,
+    40.0,
+    50.0,
+    60.0,
+    120.0,
+    240.0,
+    480.0,
+    960.0,
+    1920.0,
+    7680.0,
 ]
 
 
-class MetricsManager:
-    """Prometheus Metrics Manager handles all metric updates """
+class MetricsManager(MetricsManagerInterface):
+    """Prometheus Metrics Manager handles all metric updates"""
 
     _instance = None
+    _collect_zmq_metrics = False
+    cache_config_info = None
 
-    num_requests_running: 'Gauge'
-    num_requests_waiting: 'Gauge'
-    time_to_first_token: 'Histogram'
-    time_per_output_token: 'Histogram'
-    request_inference_time: 'Histogram'
-    request_queue_time: 'Histogram'
+    num_requests_running: "Gauge"
+    num_requests_waiting: "Gauge"
+    num_requests_queuing: "Gauge"
+    time_to_first_token: "Histogram"
+    time_per_output_token: "Histogram"
+    request_inference_time: "Histogram"
+    request_queue_time: "Histogram"
+    gpu_cache_usage_perc: "Gauge"
+    generation_tokens_total: "Counter"
+    request_prefill_time: "Histogram"
+    request_decode_time: "Histogram"
+    request_generation_tokens: "Histogram"
+    request_success_total: "Counter"
+    spec_decode_draft_acceptance_rate: "Gauge"
+    spec_decode_efficiency: "Gauge"
+    spec_decode_num_accepted_tokens_total: "Gauge"
+    spec_decode_num_draft_tokens_total: "Counter"
+    spec_decode_num_emitted_tokens_total: "Gauge"
+    spec_decode_draft_single_head_acceptance_rate: "Gauge"
+
+    prefix_cache_token_num: "Counter"
+    prefix_gpu_cache_token_num: "Counter"
+    prefix_cpu_cache_token_num: "Counter"
+    prefix_ssd_cache_token_num: "Counter"
+    batch_size: "Gauge"
+    max_batch_size: "Gauge"
+    available_gpu_block_num: "Gauge"
+    free_gpu_block_num: "Gauge"
+    max_gpu_block_num: "Gauge"
+    max_cpu_block_num: "Gauge"
+    available_gpu_resource: "Gauge"
+    requests_number: "Counter"
+    send_cache_failed_num: "Counter"
+    cache_config_info: "Gauge"
+    available_batch_size: "Gauge"
+    hit_req_rate: "Gauge"
+    hit_token_rate: "Gauge"
+    cpu_hit_token_rate: "Gauge"
+    gpu_hit_token_rate: "Gauge"
+
+    # for http request
+    http_requests_total: "Counter"
+    http_request_duration_seconds: "Histogram"
+
+    # for zmq
+    msg_send_total: "Counter"
+    msg_send_failed_total: "Counter"
+    msg_bytes_send_total: "Counter"
+    msg_recv_total: "Counter"
+    msg_bytes_recv_total: "Counter"
+    zmq_latency: "Histogram"
+    # for request metrics
+    e2e_request_latency: "Histogram"
+    request_params_max_tokens: "Histogram"
+    prompt_tokens_total: "Counter"
+    request_prompt_tokens: "Histogram"
+    request_token_ratio: "Histogram"
+
+    # for pd
+    decode_preallocated_req_num: "Gauge"
+    reschedule_req_num: "Counter"
+    failed_recv_first_token_req_num: "Counter"
 
     # 定义所有指标配置
-    METRICS = {
-        'num_requests_running': {
-            'type': Gauge,
-            'name': 'fastdeploy:num_requests_running',
-            'description': 'Number of requests currently running',
-            'kwargs': {}
-        },
-        'num_requests_waiting': {
-            'type': Gauge,
-            'name': 'fastdeploy:num_requests_waiting',
-            'description': 'Number of requests currently waiting',
-            'kwargs': {}
-        },
-        'time_to_first_token': {
-            'type': Histogram,
-            'name': 'fastdeploy:time_to_first_token_seconds',
-            'description': 'Time to first token in seconds',
-            'kwargs': {
-                'buckets': [0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0]
-            }
-        },
-        'time_per_output_token': {
-            'type': Histogram,
-            'name': 'fastdeploy:time_per_output_token_seconds',
-            'description': 'Time per output token in seconds',
-            'kwargs': {
-                'buckets': [0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0]
-            }
-        },
 
-        'request_inference_time': {
-            'type': Histogram,
-            'name': 'fastdeploy:request_inference_time_seconds',
-            'description': 'Time spent in inference phase (from inference start to last token)',
-            'kwargs': {
-                'buckets': REQUEST_LATENCY_BUCKETS
-            }
+    # gauge指标在多进程中，会有pid隔离，需要特殊处理，因此手动定义出来
+    GAUGE_METRICS = {
+        "num_requests_running": {
+            "type": Gauge,
+            "name": "fastdeploy:num_requests_running",
+            "description": "Number of requests currently running",
+            "kwargs": {},
         },
-        'request_queue_time': {
-            'type': Histogram,
-            'name': 'fastdeploy:request_queue_time_seconds',
-            'description': 'Time spent in waiting queue (from preprocess end to inference start)',
-            'kwargs': {
-                'buckets': REQUEST_LATENCY_BUCKETS
-            }
-        }
+        "num_requests_waiting": {
+            "type": Gauge,
+            "name": "fastdeploy:num_requests_waiting",
+            "description": "Number of requests currently waiting in resource manager",
+            "kwargs": {},
+        },
+        "num_requests_queuing": {
+            "type": Gauge,
+            "name": "fastdeploy:num_requests_queuing",
+            "description": "Number of requests currently queuing in local scheduler",
+            "kwargs": {},
+        },
+        "gpu_cache_usage_perc": {
+            "type": Gauge,
+            "name": "fastdeploy:gpu_cache_usage_perc",
+            "description": "GPU KV-cache usage. 1 means 100 percent usage",
+            "kwargs": {},
+        },
+        "batch_size": {
+            "type": Gauge,
+            "name": "fastdeploy:batch_size",
+            "description": "Real batch size during inference",
+            "kwargs": {},
+        },
+        "max_batch_size": {
+            "type": Gauge,
+            "name": "fastdeploy:max_batch_size",
+            "description": "Maximum batch size determined when service started",
+            "kwargs": {},
+        },
+        "available_gpu_block_num": {
+            "type": Gauge,
+            "name": "fastdeploy:available_gpu_block_num",
+            "description": "Number of available gpu blocks in cache, including blocks in LRU list",
+            "kwargs": {},
+        },
+        "free_gpu_block_num": {
+            "type": Gauge,
+            "name": "fastdeploy:free_gpu_block_num",
+            "description": "Number of free blocks in cache",
+            "kwargs": {},
+        },
+        "max_gpu_block_num": {
+            "type": Gauge,
+            "name": "fastdeploy:max_gpu_block_num",
+            "description": "Number of total GPU blocks determined when service started",
+            "kwargs": {},
+        },
+        "max_cpu_block_num": {
+            "type": Gauge,
+            "name": "fastdeploy:max_cpu_block_num",
+            "description": "Number of total CPU blocks determined when service started",
+            "kwargs": {},
+        },
+        "available_gpu_resource": {
+            "type": Gauge,
+            "name": "fastdeploy:available_gpu_resource",
+            "description": "Available blocks percentage, i.e. available_gpu_block_num / max_gpu_block_num",
+            "kwargs": {},
+        },
+        "first_token_latency": {
+            "type": Gauge,
+            "name": "fastdeploy:first_token_latency",
+            "description": "Latest time to first token in seconds",
+            "kwargs": {},
+        },
+        "infer_latency": {
+            "type": Gauge,
+            "name": "fastdeploy:infer_latency",
+            "description": "Latest time to generate one token in seconds",
+            "kwargs": {},
+        },
+        "available_batch_size": {
+            "type": Gauge,
+            "name": "fastdeploy:available_batch_size",
+            "description": "Number of requests that can still be inserted during the Decode phase",
+            "kwargs": {},
+        },
+        "hit_req_rate": {
+            "type": Gauge,
+            "name": "fastdeploy:hit_req_rate",
+            "description": "Request-level prefix cache hit rate",
+            "kwargs": {},
+        },
+        "hit_token_rate": {
+            "type": Gauge,
+            "name": "fastdeploy:hit_token_rate",
+            "description": "Token-level prefix cache hit rate",
+            "kwargs": {},
+        },
+        "cpu_hit_token_rate": {
+            "type": Gauge,
+            "name": "fastdeploy:cpu_hit_token_rate",
+            "description": "Token-level CPU prefix cache hit rate",
+            "kwargs": {},
+        },
+        "gpu_hit_token_rate": {
+            "type": Gauge,
+            "name": "fastdeploy:gpu_hit_token_rate",
+            "description": "Token-level GPU prefix cache hit rate",
+            "kwargs": {},
+        },
+        "decode_preallocated_req_num": {
+            "type": Gauge,
+            "name": "fastdeploy:decode_preallocated_req_num",
+            "description": "Number of preallocated requests in decode instance",
+            "kwargs": {},
+        },
     }
+
+    METRICS = {
+        "time_to_first_token": {
+            "type": Histogram,
+            "name": "fastdeploy:time_to_first_token_seconds",
+            "description": "Time to first token in seconds",
+            "kwargs": {
+                "buckets": [
+                    0.001,
+                    0.005,
+                    0.01,
+                    0.02,
+                    0.04,
+                    0.06,
+                    0.08,
+                    0.1,
+                    0.25,
+                    0.5,
+                    0.75,
+                    1.0,
+                ]
+            },
+        },
+        "time_per_output_token": {
+            "type": Histogram,
+            "name": "fastdeploy:time_per_output_token_seconds",
+            "description": "Time per output token in seconds",
+            "kwargs": {
+                "buckets": [
+                    0.01,
+                    0.025,
+                    0.05,
+                    0.075,
+                    0.1,
+                    0.15,
+                    0.2,
+                    0.3,
+                    0.4,
+                    0.5,
+                    0.75,
+                    1.0,
+                ]
+            },
+        },
+        "request_inference_time": {
+            "type": Histogram,
+            "name": "fastdeploy:request_inference_time_seconds",
+            "description": "Time spent in inference phase (from inference start to last token)",
+            "kwargs": {"buckets": REQUEST_LATENCY_BUCKETS},
+        },
+        "request_queue_time": {
+            "type": Histogram,
+            "name": "fastdeploy:request_queue_time_seconds",
+            "description": "Time spent in waiting queue (from preprocess end to inference start)",
+            "kwargs": {"buckets": REQUEST_LATENCY_BUCKETS},
+        },
+        "generation_tokens_total": {
+            "type": Counter,
+            "name": "fastdeploy:generation_tokens_total",
+            "description": "Total number of generation tokens processed",
+            "kwargs": {},
+        },
+        "request_prefill_time": {
+            "type": Histogram,
+            "name": "fastdeploy:request_prefill_time_seconds",
+            "description": "Time spent in prefill phase (from preprocess start to preprocess end)",
+            "kwargs": {"buckets": REQUEST_LATENCY_BUCKETS},
+        },
+        "request_decode_time": {
+            "type": Histogram,
+            "name": "fastdeploy:request_decode_time_seconds",
+            "description": "Time spent in decode phase (from first token to last token)",
+            "kwargs": {"buckets": REQUEST_LATENCY_BUCKETS},
+        },
+        "request_generation_tokens": {
+            "type": Histogram,
+            "name": "fastdeploy:request_generation_tokens",
+            "description": "Number of generation tokens processed.",
+            "kwargs": {"buckets": build_1_2_5_buckets(33792)},
+        },
+        "request_success_total": {
+            "type": Counter,
+            "name": "fastdeploy:request_success_total",
+            "description": "Total number of successfully processed requests",
+            "kwargs": {},
+        },
+        # for YIYAN Adapter
+        "prefix_cache_token_num": {
+            "type": Counter,
+            "name": "fastdeploy:prefix_cache_token_num",
+            "description": "Total number of cached tokens",
+            "kwargs": {},
+        },
+        "prefix_gpu_cache_token_num": {
+            "type": Counter,
+            "name": "fastdeploy:prefix_gpu_cache_token_num",
+            "description": "Total number of cached tokens on GPU",
+            "kwargs": {},
+        },
+        "prefix_cpu_cache_token_num": {
+            "type": Counter,
+            "name": "fastdeploy:prefix_cpu_cache_token_num",
+            "description": "Total number of cached tokens on CPU",
+            "kwargs": {},
+        },
+        "prefix_ssd_cache_token_num": {
+            "type": Counter,
+            "name": "fastdeploy:prefix_ssd_cache_token_num",
+            "description": "Total number of cached tokens on SSD",
+            "kwargs": {},
+        },
+        "requests_number": {
+            "type": Counter,
+            "name": "fastdeploy:requests_number",
+            "description": "Total number of requests received",
+            "kwargs": {},
+        },
+        "send_cache_failed_num": {
+            "type": Counter,
+            "name": "fastdeploy:send_cache_failed_num",
+            "description": "Total number of failures of sending cache",
+            "kwargs": {},
+        },
+        # for http
+        "http_requests_total": {
+            "type": Counter,
+            "name": "http_requests_total",
+            "description": "Total number of requests by method, status and handler.",
+            "kwargs": {"labelnames": ["method", "path", "status_code"]},
+        },
+        "http_request_duration_seconds": {
+            "type": Histogram,
+            "name": "http_request_duration_seconds",
+            "description": "Duration of HTTP requests in seconds",
+            "kwargs": {
+                "labelnames": ["method", "path"],
+                "buckets": [
+                    0.01,
+                    0.025,
+                    0.05,
+                    0.1,
+                    0.25,
+                    0.5,
+                    0.75,
+                    1.0,
+                    1.5,
+                    2.0,
+                    2.5,
+                    3.0,
+                    3.5,
+                    4.0,
+                    4.5,
+                    5.0,
+                    7.5,
+                    10,
+                    30,
+                    60,
+                ],
+            },
+        },
+        "reschedule_req_num": {
+            "type": Counter,
+            "name": "fastdeploy:reschedule_req_num",
+            "description": "Total number of reschedule requests",
+            "kwargs": {},
+        },
+        "failed_recv_first_token_req_num": {
+            "type": Counter,
+            "name": "fastdeploy:failed_recv_first_token_req_num",
+            "description": "Total number of failed requests to receive the first token in decode",
+            "kwargs": {},
+        },
+    }
+
+    SPECULATIVE_METRICS = {}
+
+    ZMQ_METRICS = {
+        "msg_send_total": {
+            "type": Counter,
+            "name": "fastdeploy:zmq:msg_send_total",
+            "description": "Total number of zmq messages sent",
+            "kwargs": {"labelnames": ["address"]},
+        },
+        "msg_send_failed_total": {
+            "type": Counter,
+            "name": "fastdeploy:zmq:msg_send_failed_total",
+            "description": "Total number of zmq messages send failed",
+            "kwargs": {"labelnames": ["address"]},
+        },
+        "msg_bytes_send_total": {
+            "type": Counter,
+            "name": "fastdeploy:zmq:msg_bytes_send_total",
+            "description": "Total number of bytes sent over zmq",
+            "kwargs": {"labelnames": ["address"]},
+        },
+        "msg_recv_total": {
+            "type": Counter,
+            "name": "fastdeploy:zmq:msg_recv_total",
+            "description": "Total number of zmq messages received",
+            "kwargs": {"labelnames": ["address"]},
+        },
+        "msg_bytes_recv_total": {
+            "type": Counter,
+            "name": "fastdeploy:zmq:msg_bytes_recv_total",
+            "description": "Total number of bytes received over zmq",
+            "kwargs": {"labelnames": ["address"]},
+        },
+        "zmq_latency": {
+            "type": Histogram,
+            "name": "fastdeploy:zmq:latency",
+            "description": "Latency of zmq message (in millisecond)",
+            "kwargs": {
+                "labelnames": ["address"],
+                "buckets": [
+                    0.001,
+                    0.01,
+                    0.02,
+                    0.05,
+                    0.1,
+                    0.25,
+                    0.5,
+                    1.0,
+                    2.0,
+                    5.0,
+                    10.0,
+                    20.0,
+                    50.0,
+                    100.0,
+                    200.0,
+                    500.0,
+                    1000.0,
+                ],
+            },
+        },
+    }
+
+    SERVER_METRICS = {
+        "e2e_request_latency": {
+            "type": Histogram,
+            "name": "fastdeploy:e2e_request_latency_seconds",
+            "description": "End-to-end request latency (from request arrival to final response)",
+            "kwargs": {
+                "buckets": [
+                    0.3,
+                    0.5,
+                    0.8,
+                    1.0,
+                    1.5,
+                    2.0,
+                    2.5,
+                    5.0,
+                    10.0,
+                    15.0,
+                    20.0,
+                    30.0,
+                    40.0,
+                    50.0,
+                    60.0,
+                    120.0,
+                    240.0,
+                    480.0,
+                    960.0,
+                    1920.0,
+                    7680.0,
+                ]
+            },
+        },
+        "request_params_max_tokens": {
+            "type": Histogram,
+            "name": "fastdeploy:request_params_max_tokens",
+            "description": "Histogram of max_tokens parameter in request parameters",
+            "kwargs": {"buckets": build_1_2_5_buckets(33792)},
+        },
+        "prompt_tokens_total": {
+            "type": Counter,
+            "name": "fastdeploy:prompt_tokens_total",
+            "description": "Total number of prompt tokens processed",
+            "kwargs": {},
+        },
+        "request_prompt_tokens": {
+            "type": Histogram,
+            "name": "fastdeploy:request_prompt_tokens",
+            "description": "Number of prefill tokens processed",
+            "kwargs": {"buckets": build_1_2_5_buckets(33792)},
+        },
+        "request_token_ratio": {
+            "type": Histogram,
+            "name": "fastdeploy:request_token_ratio",
+            "description": "Ratio of output tokens to input tokens (generation_tokens / prompt_tokens)",
+            "kwargs": {
+                "buckets": [
+                    0,
+                    5,
+                    10,
+                    15,
+                    20,
+                    25,
+                    30,
+                    35,
+                    40,
+                    45,
+                    50,
+                    55,
+                    60,
+                    65,
+                    70,
+                    75,
+                    80,
+                    85,
+                    90,
+                    95,
+                    100,
+                    105,
+                    110,
+                    115,
+                    120,
+                    125,
+                    130,
+                    135,
+                    140,
+                    145,
+                    150,
+                    155,
+                    160,
+                    165,
+                    170,
+                    175,
+                    180,
+                    185,
+                    190,
+                    195,
+                    200,
+                ]
+            },
+        },
+    }
+
+    def _patch_labelnames(self, metrics_dict: dict) -> dict:
+        """When _enable_labels is True, add keys from _default_labelvalues to
+        labelnames for all metrics. Does not modify the original dict.
+
+        Returns a deep-copied dict with patched kwargs.
+        """
+        if not self._enable_labels:
+            return metrics_dict
+        patched = {}
+        for name, config in metrics_dict.items():
+            new_config = copy.deepcopy(config)
+            kwargs = new_config["kwargs"]
+            if "labelnames" in kwargs:
+                for label in self._default_labelvalues:
+                    if label not in kwargs["labelnames"]:
+                        kwargs["labelnames"].append(label)
+            else:
+                kwargs["labelnames"] = list(self._default_labelvalues.keys())
+            patched[name] = new_config
+        return patched
 
     def __init__(self):
         """Initializes the Prometheus metrics and starts the HTTP server if not already initialized."""
-        # 动态创建所有指标
-        for metric_name, config in self.METRICS.items():
-            setattr(self, metric_name, config['type'](
-                config['name'],
-                config['description'],
-                **config['kwargs']
-            ))
 
-    def register_all(self, registry: CollectorRegistry, workers: int = 1):
+        # 解析 FD_DEFAULT_METRIC_LABEL_VALUES
+        # 当值为合法 JSON dict 且非空时启用 metric labels
+        try:
+            self._default_labelvalues = json.loads(envs.FD_DEFAULT_METRIC_LABEL_VALUES)
+        except (json.JSONDecodeError, TypeError):
+            self._default_labelvalues = {}
+        self._enable_labels = isinstance(self._default_labelvalues, dict) and len(self._default_labelvalues) > 0
+        if self._enable_labels:
+            llm_logger.info(f"Metric labels are enabled with default values: {self._default_labelvalues}")
+
+        # 在模块加载，指标注册先设置Prometheus环境变量
+        setup_multiprocess_prometheus()
+
+        # 用 _patch_labelnames 处理后的副本创建指标，不修改类级别原始 dict
+        patched_metrics = self._patch_labelnames(self.METRICS)
+        patched_gauge_metrics = self._patch_labelnames(self.GAUGE_METRICS)
+        patched_server_metrics = self._patch_labelnames(self.SERVER_METRICS)
+
+        # 动态创建所有非 gauge 型指标
+        for metric_name, config in patched_metrics.items():
+            setattr(
+                self,
+                metric_name,
+                config["type"](config["name"], config["description"], **config["kwargs"]),
+            )
+        # 动态创建所有 gauge 型指标，统一配置 multiprocess_mode 为 livesum
+        for metric_name, config in patched_gauge_metrics.items():
+            kwargs = config["kwargs"].copy()
+            if "multiprocess_mode" not in kwargs:
+                kwargs["multiprocess_mode"] = "livesum"
+            setattr(
+                self,
+                metric_name,
+                config["type"](config["name"], config["description"], **kwargs),
+            )
+        # 动态创建server metrics
+        for metric_name, config in patched_server_metrics.items():
+            setattr(
+                self,
+                metric_name,
+                config["type"](config["name"], config["description"], **config["kwargs"]),
+            )
+
+    def _get_metric_and_labels(self, name: str, labelvalues: dict = None):
+        """Get the metric object and merged labelvalues.
+
+        When _enable_labels is True, returns (metric, merged_labels) where
+        merged_labels is the union of _default_labelvalues and caller-provided
+        labelvalues. When False but caller provides labelvalues (for metrics
+        with their own labelnames like spec_decode_draft_single_head_acceptance_rate),
+        returns (metric, labelvalues). Otherwise returns (metric, None).
+        """
+        metric = getattr(self, name)
+        if not self._enable_labels:
+            if labelvalues:
+                return metric, labelvalues
+            return metric, None
+        merged = dict(self._default_labelvalues)
+        if labelvalues:
+            merged.update(labelvalues)
+        return metric, merged
+
+    def set_value(self, name: str, value, labelvalues: dict = None):
+        """Set a Gauge metric to the given value."""
+        metric, merged = self._get_metric_and_labels(name, labelvalues)
+        if merged is not None:
+            metric.labels(**merged).set(value)
+        else:
+            metric.set(value)
+
+    def inc_value(self, name: str, value=1, labelvalues: dict = None):
+        """Increment a Counter or Gauge metric by the given value."""
+        metric, merged = self._get_metric_and_labels(name, labelvalues)
+        if merged is not None:
+            metric.labels(**merged).inc(value)
+        else:
+            metric.inc(value)
+
+    def dec_value(self, name: str, value=1, labelvalues: dict = None):
+        """Decrement a Gauge metric by the given value."""
+        metric, merged = self._get_metric_and_labels(name, labelvalues)
+        if merged is not None:
+            metric.labels(**merged).dec(value)
+        else:
+            metric.dec(value)
+
+    def obs_value(self, name: str, value, labelvalues: dict = None):
+        """Observe a value on a Histogram metric."""
+        metric, merged = self._get_metric_and_labels(name, labelvalues)
+        if merged is not None:
+            metric.labels(**merged).observe(value)
+        else:
+            metric.observe(value)
+
+    def _init_speculative_metrics(self, speculative_method, num_speculative_tokens):
+        self.SPECULATIVE_METRICS = {
+            "spec_decode_draft_acceptance_rate": {
+                "type": Gauge,
+                "name": "fastdeploy:spec_decode_draft_acceptance_rate",
+                "description": "Acceptance rate of speculative decoding",
+                "kwargs": {},
+            },
+            "spec_decode_num_accepted_tokens_total": {
+                "type": Gauge,
+                "name": "fastdeploy:spec_decode_num_accepted_tokens_total",
+                "description": "Total number of tokens accepted by the scoring model and verification program",
+                "kwargs": {},
+            },
+            "spec_decode_num_emitted_tokens_total": {
+                "type": Gauge,
+                "name": "fastdeploy:spec_decode_num_emitted_tokens_total",
+                "description": "Total number of tokens output by the entire system",
+                "kwargs": {},
+            },
+        }
+        if speculative_method == SpecMethod.MTP:
+            self.SPECULATIVE_METRICS["spec_decode_efficiency"] = {
+                "type": Gauge,
+                "name": "fastdeploy:spec_decode_efficiency",
+                "description": "Efficiency of speculative decoding",
+                "kwargs": {},
+            }
+            self.SPECULATIVE_METRICS["spec_decode_num_draft_tokens_total"] = {
+                "type": Counter,
+                "name": "fastdeploy:spec_decode_num_draft_tokens_total",
+                "description": "Total number of speculative tokens generated by the proposal method",
+                "kwargs": {},
+            }
+            self.SPECULATIVE_METRICS["spec_decode_draft_single_head_acceptance_rate"] = {
+                "type": Gauge,
+                "name": "fastdeploy:spec_decode_draft_single_head_acceptance_rate",
+                "description": "Single head acceptance rate of speculative decoding",
+                "kwargs": {"labelnames": ["head"]},
+            }
+
+        patched_spec_metrics = self._patch_labelnames(self.SPECULATIVE_METRICS)
+
+        for metric_name, config in patched_spec_metrics.items():
+            # For Gauge metrics, automatically add multiprocess_mode="livesum"
+            kwargs = config["kwargs"].copy()
+            if config["type"] == Gauge and "multiprocess_mode" not in kwargs:
+                kwargs["multiprocess_mode"] = "livesum"
+            setattr(
+                self,
+                metric_name,
+                config["type"](
+                    config["name"],
+                    config["description"],
+                    **kwargs,
+                ),
+            )
+
+    def init_zmq_metrics(self):
+        # 用 _patch_labelnames 处理 ZMQ_METRICS dict 后再创建指标
+        patched_zmq_metrics = self._patch_labelnames(self.ZMQ_METRICS)
+        for metric_name, config in patched_zmq_metrics.items():
+            setattr(
+                self,
+                metric_name,
+                config["type"](config["name"], config["description"], **config["kwargs"]),
+            )
+        self._collect_zmq_metrics = True
+
+    def record_zmq_stats(self, zmq_metrics_stats: ZMQMetricsStats, address: str = "unknown"):
+        """
+        Recording zmq statistics.
+        """
+        # 判断是否开启了zmq指标收集
+        if not self._collect_zmq_metrics:
+            return
+
+        # 构建 zmq labelvalues: address + _default_labelvalues
+        zmq_labels = dict()
+        if self._enable_labels:
+            zmq_labels.update(self._default_labelvalues)
+        zmq_labels.update({"address": address})
+
+        # 记录zmq统计信息
+        self.msg_send_total.labels(**zmq_labels).inc(zmq_metrics_stats.msg_send_total)
+        self.msg_send_failed_total.labels(**zmq_labels).inc(zmq_metrics_stats.msg_send_failed_total)
+        self.msg_bytes_send_total.labels(**zmq_labels).inc(zmq_metrics_stats.msg_bytes_send_total)
+        self.msg_recv_total.labels(**zmq_labels).inc(zmq_metrics_stats.msg_recv_total)
+        self.msg_bytes_recv_total.labels(**zmq_labels).inc(zmq_metrics_stats.msg_bytes_recv_total)
+        if zmq_metrics_stats.zmq_latency > 0.0:
+            # trans to millisecond
+            self.zmq_latency.labels(**zmq_labels).observe(zmq_metrics_stats.zmq_latency * 1000)
+
+    def set_cache_config_info(self, obj) -> None:
+        metrics_info = obj.metrics_info()
+
+        if hasattr(self, "cache_config_info") and isinstance(self.cache_config_info, Gauge):
+            if metrics_info:
+                # 合并 default labelvalues
+                merged = dict()
+                if self._enable_labels:
+                    merged.update(self._default_labelvalues)
+                merged.update(metrics_info)
+                self.cache_config_info.labels(**merged).set(1)
+            return
+
+        if not metrics_info:
+            return
+
+        # 动态创建 cache_config_info gauge，追加 default labelvalues 的 labelnames
+        labelnames = list(metrics_info.keys())
+        if self._enable_labels:
+            for label in self._default_labelvalues:
+                if label not in labelnames:
+                    labelnames.append(label)
+
+        self.cache_config_info = Gauge(
+            name="fastdeploy:cache_config_info",
+            documentation="Information of the engine's CacheConfig",
+            labelnames=labelnames,
+            multiprocess_mode="mostrecent",
+        )
+
+        merged = dict()
+        if self._enable_labels:
+            merged.update(self._default_labelvalues)
+        merged.update(metrics_info)  # Priority: metrics_info > default
+        self.cache_config_info.labels(**merged).set(1)
+
+    def register_speculative_metrics(self, registry: CollectorRegistry):
+        """Register all speculative metrics to the specified registry"""
+        for metric_name in self.SPECULATIVE_METRICS:
+            registry.register(getattr(self, metric_name))
+
+    def re_register_speculative_gauge(self, registry: CollectorRegistry):
+        """Re-register gauge metrics from SPECULATIVE_METRICS to the specified registry"""
+        # Check if SPECULATIVE_METRICS was initialized in this process
+        # (it's an instance attribute set by _init_speculative_metrics, not the class-level empty dict)
+        if not hasattr(self, "spec_decode_draft_acceptance_rate"):
+            return
+        for metric_name, config in self.SPECULATIVE_METRICS.items():
+            if config["type"] == Gauge:
+                registry.register(getattr(self, metric_name))
+
+    def re_register_gauge(self, registry: CollectorRegistry):
+        """Re-register gauge to the specified registry"""
+        for metric_name in self.GAUGE_METRICS:
+            registry.register(getattr(self, metric_name))
+
+    def register_all(self, registry: CollectorRegistry):
         """Register all metrics to the specified registry"""
+
         for metric_name in self.METRICS:
             registry.register(getattr(self, metric_name))
-        if workers == 1:
-            registry.register(work_process_metrics.e2e_request_latency)
 
-    @classmethod
-    def get_excluded_metrics(cls) -> Set[str]:
+        for metric_name in self.GAUGE_METRICS:
+            registry.register(getattr(self, metric_name))
+
+        for metric_name in self.SERVER_METRICS:
+            registry.register(getattr(self, metric_name))
+
+        if self.cache_config_info is not None:
+            registry.register(self.cache_config_info)
+
+        if hasattr(main_process_metrics, "spec_decode_draft_acceptance_rate"):
+            self.register_speculative_metrics(registry)
+
+    def get_excluded_metrics(self) -> Set[str]:
         """Get the set of indicator names that need to be excluded"""
-        return {config['name'] for config in cls.METRICS.values()}
+        excluded = {config["name"] for config in self.GAUGE_METRICS.values()}
+        # Also add gauge metrics from SPECULATIVE_METRICS (if initialized)
+        if hasattr(self, "SPECULATIVE_METRICS"):
+            for config in self.SPECULATIVE_METRICS.values():
+                if config["type"] == Gauge:
+                    excluded.add(config["name"])
+        return excluded
 
 
 main_process_metrics = MetricsManager()
 
-EXCLUDE_LABELS = MetricsManager.get_excluded_metrics()
+# 由于zmq指标记录比较耗时，默认不开启，通过DEBUG参数开启
+if envs.FD_DEBUG:
+    main_process_metrics.init_zmq_metrics()

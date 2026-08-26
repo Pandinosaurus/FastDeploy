@@ -14,49 +14,420 @@
 # limitations under the License.
 """
 
-import setuptools
+import glob
 import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+from functools import lru_cache
+from pathlib import Path
+
+import paddle
+from packaging import tags
+from setuptools import Extension, find_packages, setup
+from setuptools.command.build_ext import build_ext
+from setuptools.command.install import install
+from wheel.bdist_wheel import bdist_wheel
 
 long_description = "FastDeploy: Large Language Model Serving.\n\n"
 long_description += "GitHub: https://github.com/PaddlePaddle/FastDeploy\n"
 long_description += "Email: dltp@baidu.com"
 
+# Platform to CMake mapping
+PLAT_TO_CMAKE = {
+    "win32": "Win32",
+    "win-amd64": "x64",
+    "win-arm32": "ARM",
+    "win-arm64": "ARM64",
+}
+
+
+FD_ROUTER_BASE_URL = "https://paddle-qa.bj.bcebos.com/paddle-pipeline/FastDeploy_ActionCE/develop/latest"
+
+# Map host architecture to binary filename and expected `file` output pattern.
+FD_ROUTER_ARCH_MAP = {
+    "x86_64": {
+        "filename": "fd-router",
+        "file_pattern": "x86-64",
+    },
+    "aarch64": {
+        "filename": "fd-router-aarch64",
+        "file_pattern": "aarch64|ARM aarch64",
+    },
+}
+
+
+def download_fd_router():
+    """Download fd-router binary if not already present.
+
+    Downloads the pre-compiled golang router binary into the source tree
+    so it gets packaged into the wheel. Skipped on non-Linux or unsupported
+    architectures. Download failure is non-fatal (golang router is optional).
+    """
+    host_arch = platform.machine()
+    arch_info = FD_ROUTER_ARCH_MAP.get(host_arch)
+    if arch_info is None:
+        print(
+            f"[golang_router] Unsupported architecture '{host_arch}', skipping download "
+            f"(please build from source: https://github.com/PaddlePaddle/FastDeploy/tree/develop/fastdeploy/golang_router)"
+        )
+        return
+
+    router_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fastdeploy", "golang_router")
+    router_bin = os.path.join(router_dir, "fd-router")
+
+    if os.path.isfile(router_bin) and os.access(router_bin, os.X_OK):
+        print("[golang_router] fd-router already exists, skipping download")
+        return
+
+    if platform.system() != "Linux":
+        print(f"[golang_router] Skipping download on {platform.system()}")
+        return
+
+    download_url = f"{FD_ROUTER_BASE_URL}/{arch_info['filename']}"
+    print(f"[golang_router] Downloading fd-router binary for {host_arch}...")
+    os.makedirs(router_dir, exist_ok=True)
+
+    tmp_bin = router_bin + ".tmp"
+    try:
+        subprocess.run(
+            ["wget", "-q", "--no-proxy", download_url, "-O", tmp_bin],
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("[golang_router] WARNING: Failed to download fd-router, skipping (golang router is optional)")
+        if os.path.exists(tmp_bin):
+            os.remove(tmp_bin)
+        return
+
+    # Sanity checks
+    try:
+        file_output = subprocess.run(["file", tmp_bin], capture_output=True, text=True, check=True).stdout
+        if "ELF" not in file_output:
+            print("[golang_router] WARNING: fd-router is not an ELF binary, skipping")
+            os.remove(tmp_bin)
+            return
+        if not re.search(arch_info["file_pattern"], file_output):
+            print(f"[golang_router] WARNING: fd-router architecture mismatch (expected {host_arch}), skipping")
+            os.remove(tmp_bin)
+            return
+
+        file_size = os.path.getsize(tmp_bin)
+        if file_size < 1_000_000:
+            print(f"[golang_router] WARNING: fd-router size too small ({file_size} bytes), skipping")
+            os.remove(tmp_bin)
+            return
+    except Exception as e:
+        print(f"[golang_router] WARNING: Sanity check failed: {e}, skipping")
+        if os.path.exists(tmp_bin):
+            os.remove(tmp_bin)
+        return
+
+    shutil.move(tmp_bin, router_bin)
+    os.chmod(router_bin, 0o755)
+    print("[golang_router] fd-router downloaded successfully")
+
+
+class CustomBdistWheel(bdist_wheel):
+    """Custom wheel builder."""
+
+    def run(self):
+        download_fd_router()
+        super().run()
+
+    def finalize_options(self):
+        """Configure wheel as {python tag}-{abi tag}-{platform tag}."""
+        super().finalize_options()
+        tag = next(tags.sys_tags())
+        self.root_is_pure = False
+        self.python_tag = tag.interpreter
+        self.abi_tag = tag.abi
+        self.plat_name_supplied = True
+        self.plat_name = tag.platform
+
+
+class CMakeExtension(Extension):
+    """A setuptools Extension for CMake-based builds."""
+
+    def __init__(self, name: str, sourcedir: str = "", version: str = None) -> None:
+        """
+        Initialize CMake extension.
+
+        Args:
+            name (str): Name of the extension.
+            sourcedir (str): Source directory path.
+            version (str): Optional version string (set to None to disable version info)
+        """
+        super().__init__(name, sources=[])
+        self.sourcedir = os.fspath(Path(sourcedir).resolve())
+        self.version = version
+
+
+class CMakeBuild(build_ext):
+    """Custom build_ext command using CMake."""
+
+    def get_ext_filename(self, ext_name):
+        """Remove Python version tag from extension filename"""
+        return ext_name.split(".")[0] + ".so"
+
+    def build_extension(self, ext: CMakeExtension) -> None:
+        """
+        Build the CMake extension.
+
+        Args:
+            ext (CMakeExtension): The extension to build.
+        """
+        ext_fullpath = Path.cwd() / self.get_ext_fullpath(ext.name)
+        extdir = ext_fullpath.parent.resolve()
+        cfg = "Debug" if int(os.environ.get("DEBUG", 0)) else "Release"
+
+        cmake_args = [
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}{os.sep}",
+            f"-DPYTHON_EXECUTABLE={sys.executable}",
+            f"-DCMAKE_BUILD_TYPE={cfg}",
+            "-DVERSION_INFO=",
+            "-DPYBIND11_PYTHON_VERSION=",
+            "-DPYTHON_VERSION=",
+            f"-DPYTHON_INCLUDE_DIR={sys.prefix}/include/python{sys.version_info.major}.{sys.version_info.minor}",
+            f"-DPYTHON_LIBRARY={sys.prefix}/lib/libpython{sys.version_info.major}.{sys.version_info.minor}.so",
+        ]
+        build_args = []
+
+        cmake_generator = os.environ.get("CMAKE_GENERATOR", "")
+        if self.compiler.compiler_type != "msvc":
+            if not cmake_generator or cmake_generator == "Ninja":
+                try:
+                    import ninja
+
+                    ninja_executable_path = Path(ninja.BIN_DIR) / "ninja"
+                    cmake_args += [
+                        "-GNinja",
+                        f"-DCMAKE_MAKE_PROGRAM:FILEPATH={ninja_executable_path}",
+                    ]
+                except ImportError:
+                    pass
+        else:
+            if "NMake" not in cmake_generator and "Ninja" not in cmake_generator:
+                cmake_args += ["-A", PLAT_TO_CMAKE[self.plat_name]]
+            if "NMake" not in cmake_generator and "Ninja" not in cmake_generator:
+                cmake_args += [f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_{cfg.upper()}={extdir}"]
+                build_args += ["--config", cfg]
+
+        if sys.platform.startswith("darwin"):
+            archs = re.findall(r"-arch (\S+)", os.environ.get("ARCHFLAGS", ""))
+            if archs:
+                cmake_args += ["-DCMAKE_OSX_ARCHITECTURES={}".format(";".join(archs))]
+
+        if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ and hasattr(self, "parallel") and self.parallel:
+            build_args += [f"-j{self.parallel}"]
+
+        build_temp = Path(self.build_temp) / ext.name
+        build_temp.mkdir(parents=True, exist_ok=True)
+
+        subprocess.run(["cmake", ext.sourcedir, *cmake_args], cwd=build_temp, check=True)
+        subprocess.run(["cmake", "--build", ".", *build_args], cwd=build_temp, check=True)
+
+
+class PostInstallCommand(install):
+    """在标准安装完成后执行自定义命令"""
+
+    def run(self):
+        # 先执行标准安装步骤
+        install.run(self)
+        # 执行自定义命令
+        subprocess.check_call(["opentelemetry-bootstrap", "-a", "install"])
+
 
 def load_requirements():
-    """加载requirements.txt中的依赖"""
-    requirements_path = os.path.join(os.path.dirname(__file__), 'requirements.txt')
-    with open(requirements_path, 'r') as f:
-        return [line.strip() for line in f if line.strip() and not line.startswith('#')]
+    """Load dependencies from requirements.txt"""
+    requirements_file_name = "requirements.txt"
+    if paddle.is_compiled_with_custom_device("iluvatar_gpu"):
+        requirements_file_name = "requirements_iluvatar.txt"
+    elif paddle.is_compiled_with_rocm():
+        requirements_file_name = "requirements_dcu.txt"
+    elif paddle.device.is_compiled_with_custom_device("metax_gpu"):
+        requirements_file_name = "requirements_metaxgpu.txt"
+    requirements_path = os.path.join(os.path.dirname(__file__), requirements_file_name)
+    with open(requirements_path, "r") as f:
+        return [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
-setuptools.setup(
-    name="fastdeploy",
-    version="2.0.0-alpha",
+
+def get_device_type():
+    """Get the device type (rocm/gpu/xpu/npu/cpu/metax-gpu) that paddle is compiled with."""
+    if paddle.is_compiled_with_rocm():
+        return "rocm"
+    elif paddle.is_compiled_with_cuda():
+        return "gpu"
+    elif paddle.is_compiled_with_xpu():
+        return "xpu"
+    elif paddle.is_compiled_with_custom_device("npu"):
+        return "npu"
+    elif paddle.is_compiled_with_custom_device("iluvatar_gpu"):
+        return "iluvatar-gpu"
+    elif paddle.is_compiled_with_custom_device("gcu"):
+        return "gcu"
+    elif paddle.device.is_compiled_with_custom_device("metax_gpu"):
+        return "metax-gpu"
+    elif paddle.is_compiled_with_custom_device("intel_hpu"):
+        return "intel-hpu"
+    else:
+        return "cpu"
+
+
+def check_header(header_path):
+    return os.path.exists(header_path)
+
+
+def check_library(lib_name):
+    # search /usr/lib /usr/lib64 /lib /lib64 .etc
+    paths = [
+        "/usr/lib",
+        "/usr/lib32",
+        "/usr/lib64",
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib",
+        "/lib32",
+        "/lib64",
+        "/usr/local/lib",
+        "/usr/local/lib64",
+    ]
+    for p in paths:
+        if glob.glob(os.path.join(p, lib_name)):
+            return True
+    return False
+
+
+def check_rdma_packages():
+    results = {}
+
+    # libibverbs-dev
+    results["libibverbs header"] = check_header("/usr/include/infiniband/verbs.h")
+    results["libibverbs library"] = check_library("libibverbs.so*") or check_library("libibverbs.so")
+
+    # librdmacm-dev
+    results["librdmacm header"] = check_header("/usr/include/rdma/rdma_cma.h")
+    results["librdmacm library"] = check_library("librdmacm.so*") or check_library("librdmacm.so")
+
+    print("===== RDMA Library Check Results =====")
+    for k, v in results.items():
+        status = "FOUND" if v else "NOT FOUND"
+        print(f"{k:25}: {status}")
+
+    print("\n== Summary ==")
+    if all(results.values()):
+        print("All required RDMA libraries are installed.")
+        return True
+    else:
+        print("Some RDMA libraries are missing. Suggested commands:")
+        print("\nUbuntu/Debian:")
+        print("    sudo apt-get install -y libibverbs-dev librdmacm-dev")
+        print("\nCentOS/RHEL:")
+        print("    sudo yum install -y libibverbs-devel librdmacm-devel")
+        return False
+
+
+@lru_cache(maxsize=1)
+def rdma_comm_supported():
+    supported = (
+        get_device_type() in ["gpu", "xpu"]
+        and check_rdma_packages()
+        and os.getenv("FD_ENABLE_RDMA_COMPILE", "1") == "1"
+    )
+    return supported
+
+
+def get_name():
+    """get package name"""
+    return "fastdeploy-" + get_device_type()
+
+
+cmdclass_dict = {"bdist_wheel": CustomBdistWheel}
+cmdclass_dict["build_ext"] = CMakeBuild
+FASTDEPLOY_VERSION = os.environ.get("FASTDEPLOY_VERSION", "2.6.0-dev")
+cmdclass_dict["build_optl"] = PostInstallCommand
+
+
+def write_version_to_file():
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    version_file_path = os.path.join(current_dir, "fastdeploy/version.txt")
+    with open(version_file_path, "a") as f:
+        f.write(f"fastdeploy version: {FASTDEPLOY_VERSION}\n")
+
+
+write_version_to_file()
+
+setup(
+    name=get_name(),
+    version=FASTDEPLOY_VERSION,
     author="PaddlePaddle",
     author_email="dltp@baidu.com",
     description="FastDeploy: Large Language Model Serving.",
     long_description=long_description,
     long_description_content_type="text/plain",
     url="https://github.com/PaddlePaddle/FastDeploy",
-    packages=setuptools.find_packages(),
+    packages=find_packages(),
     package_dir={"fastdeploy": "fastdeploy/"},
+    # For deprecated method (egg-based installation), `.so` files are placed in the `model_executor/ops/XXX` directory.
+    # For modern method (PEP 517/518-based installation), `.so` files are placed in the `model_executor/ops/XXX/fastdeploy_ops` directory.
+    # Therefore, the `fastdeploy_ops` directory should be included for modern Python packaging.
     package_data={
         "fastdeploy": [
             "model_executor/ops/gpu/*",
+            "model_executor/ops/gpu/fastdeploy_ops/*",
             "model_executor/ops/gpu/deep_gemm/include/**/*",
+            "model_executor/ops/gpu/fastdeploy_ops_*/*",
+            "model_executor/ops/gpu/fastdeploy_ops_*/fastdeploy_ops/*",
+            "model_executor/ops/gpu/fastdeploy_ops_*/deep_gemm/include/*/*",
             "model_executor/ops/cpu/*",
+            "model_executor/ops/cpu/fastdeploy_cpu_ops/*",
             "model_executor/ops/xpu/*",
+            "model_executor/ops/xpu/fastdeploy_ops/*",
+            "model_executor/ops/xpu/libs/*",
+            "model_executor/ops/xpu/fastdeploy_ops/libs/*",
             "model_executor/ops/npu/*",
+            "model_executor/ops/npu/fastdeploy_ops/*",
             "model_executor/ops/base/*",
+            "model_executor/ops/base/fastdeploy_ops/*",
+            "model_executor/ops/iluvatar/*",
+            "model_executor/ops/iluvatar/fastdeploy_ops/*",
             "model_executor/models/*",
             "model_executor/layers/*",
-            "input/mm_processor/utils/*"
+            "input/utils/Roboto-Regular.ttf",
+            "model_executor/ops/gcu/*",
+            "model_executor/ops/gcu/fastdeploy_ops/*",
+            "cache_manager/transfer_factory/get_rdma_nics.sh",
+            "golang_router/fd-router",
+            "version.txt",
         ]
     },
     install_requires=load_requirements(),
+    ext_modules=(
+        [
+            CMakeExtension(
+                "rdma_comm",
+                sourcedir="fastdeploy/cache_manager/transfer_factory/kvcache_transfer",
+                version=None,
+            )
+        ]
+        if rdma_comm_supported()
+        else []
+    ),
+    cmdclass=cmdclass_dict,
+    zip_safe=False,
     classifiers=[
-        "Programming Language :: Python :: 3", 
+        "Programming Language :: Python :: 3",
         "License :: OSI Approved :: Apache Software License",
         "Operating System :: OS Independent",
-    ],  
-    license='Apache 2.0',
-) 
+    ],
+    license="Apache 2.0",
+    python_requires=">=3.7",
+    extras_require={
+        "test": ["pytest>=6.0"],
+        "eval": ["lm-eval==0.4.9.1"],
+    },
+    entry_points={
+        "console_scripts": ["fastdeploy=fastdeploy.entrypoints.cli.main:main"],
+    },
+)

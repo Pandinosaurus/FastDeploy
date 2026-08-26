@@ -21,8 +21,8 @@ template void EncoderWriteCacheWithRopeKernel<paddle::float16, paddle::float16>(
     const paddle::Tensor& seq_lens_this_time,
     const paddle::Tensor& seq_lens_encoder,
     const paddle::Tensor& seq_lens_decoder,
-    const paddle::Tensor& padding_offsets,
-    const paddle::Tensor& cum_offsets,
+    const paddle::Tensor& batch_id_per_token,
+    const paddle::Tensor& cu_seqlens_q,
     const paddle::Tensor& block_tables,
     const paddle::Tensor& batch_ids,
     const paddle::Tensor& tile_ids,
@@ -42,4 +42,7 @@ template void EncoderWriteCacheWithRopeKernel<paddle::float16, paddle::float16>(
     cudaStream_t& stream,
     paddle::Tensor* qkv_out,
     paddle::Tensor* key_cache_out,
-    paddle::Tensor* value_cache_out);
+    paddle::Tensor* value_cache_out,
+    const paddle::optional<paddle::Tensor>& q_norm_weight,
+    const paddle::optional<paddle::Tensor>& k_norm_weight,
+    const float rms_norm_eps);

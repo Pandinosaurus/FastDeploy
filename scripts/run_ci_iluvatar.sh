@@ -1,0 +1,354 @@
+#!/bin/bash
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "$DIR"
+
+ixsmi
+
+#先kill一遍
+ps -efww | grep -E 'run_ernie_21b' | grep -v grep | awk '{print $2}' | xargs kill -9 || true
+
+unset http_proxy
+unset https_proxy
+unset no_proxy
+
+# export FD_LOG_DIR=/fdlog/$HOSTNAME
+# echo "FD log will be saved into $FD_LOG_DIR"
+export LD_PRELOAD=/usr/local/corex/lib64/libcuda.so.1
+ln -sf /usr/local/bin/python3 /usr/local/bin/python
+function pip_install_with_retry() {
+    local max_retries=3
+    local retry_delay=30
+    for ((i=1; i<=max_retries; i++)); do
+        echo "Attempt $i/$max_retries: pip install $@"
+        python -m pip install "$@" && return 0
+        echo "pip install failed (attempt $i/$max_retries)"
+        if [ $i -lt $max_retries ]; then
+            echo "Retrying in ${retry_delay}s..."
+            sleep $retry_delay
+        fi
+    done
+    echo "pip install failed after $max_retries attempts: $@"
+    return 1
+}
+
+echo "pip requirements"
+pip_install_with_retry -r requirements_iluvatar.txt
+echo "install paddle cpu and custom device"
+pip_install_with_retry --pre paddlepaddle-iluvatar -i https://www.paddlepaddle.org.cn/packages/nightly/ixuca/
+
+echo "Run paddle.utils.run_check()"
+python -c "import paddle; paddle.utils.run_check()"
+
+INCLUDE_FOLDERS=(
+    # "ERNIE_300B_4L"
+    "ERNIE-4.5-21B-A3B-Paddle"
+    "ERNIE-4.5-VL-28B-A3B-Paddle"
+    "PaddleOCR-VL"
+)
+
+MODEL_DIR=/model_data
+mkdir -p $MODEL_DIR
+SOURCE_DIR=/aistudio/paddle_ci
+echo "ls $SOURCE_DIR"
+ls $SOURCE_DIR
+
+for filename in "${INCLUDE_FOLDERS[@]}"; do
+    file=$SOURCE_DIR/$filename
+    echo "start copy $file into $MODEL_DIR ..."
+    cp -r $file $MODEL_DIR
+done
+
+CONTAINER_PP_DOC_DIR=/root/.paddlex/official_models
+mkdir -p $CONTAINER_PP_DOC_DIR
+echo "start copy $SOURCE_DIR/PP-DocLayoutV2 into $CONTAINER_PP_DOC_DIR"
+cp -r $SOURCE_DIR/PP-DocLayoutV2 $CONTAINER_PP_DOC_DIR
+
+echo "copy done"
+echo "ls $MODEL_DIR"
+ls $MODEL_DIR
+echo "ls $CONTAINER_PP_DOC_DIR"
+ls $CONTAINER_PP_DOC_DIR
+
+echo "build whl"
+bash build.sh || exit 1
+
+function print_error_message() {
+    if [ -f "log/launch_worker.log" ]; then
+        echo "------------------- log/launch_worker.log -----------------"
+        cat log/launch_worker.log
+    fi
+    if [ -f "log/paddle/workerlog.0" ]; then
+        echo "------------------- log/paddle/workerlog.0 -----------------"
+        cat log/paddle/workerlog.0
+    fi
+    if [ -f "log/paddle/workerlog.1" ]; then
+        echo "------------------- log/paddle/workerlog.1 -----------------"
+        cat log/paddle/workerlog.1
+    fi
+    if [ -f "log/error.log" ]; then
+        echo "------------------- log/error.log -----------------"
+        cat log/error.log
+    fi
+}
+
+CI_PATH=tests/ci_use/iluvatar_UT
+export PADDLE_XCCL_BACKEND=iluvatar_gpu
+export FD_SAMPLING_CLASS=rejection
+
+################# Test offline ###################
+
+offline_ci_list=(
+    ${CI_PATH}/run_ernie_21b.py
+    ${CI_PATH}/run_ernie_vl_28B.py
+    ${CI_PATH}/run_ernie_vl_28B_wint4.py
+)
+echo "test offline ci files: ${offline_ci_list[@]}"
+for cur_test_file in ${offline_ci_list[@]}
+do
+    echo "============ Offline: start to test ${cur_test_file} ==========="
+    rm -rf log/*
+    python ${cur_test_file}
+    exit_code=$?
+    echo exit_code is ${exit_code}
+
+    ps -efww | grep -E '${cur_test_file}' | grep -v grep | awk '{print $2}' | xargs kill -9 || true
+
+    if [ ${exit_code} -ne 0 ]; then
+        print_error_message
+        exit 1
+    fi
+done
+
+################# Test Online ###################
+
+function clear_message() {
+    # clear the message queue
+    ipcrm --all=msg
+    rm -rf log/* server.log
+}
+
+function stop_processes() {
+    # kill server
+    ps -efww | grep -E '8180' | grep -v grep | awk '{print $2}' | xargs kill -9 || true
+    # kill client
+    ps -efww | grep -E 'block_size 16' | grep -v grep | awk '{print $2}' | xargs kill -9 || true
+    # check
+    ps -efww | grep -E "fastdeploy" || true
+}
+
+function check_server_status() {
+    echo "Waiting 90 seconds..."
+    sleep 90
+
+    if grep -q "Failed to launch worker processes" server.log; then
+        echo "Failed to launch worker processes..."
+        stop_processes
+        cat server.log
+        cat log/paddle/workerlog.0
+        exit 1
+    fi
+
+    if grep -q "Traceback (most recent call last):" server.log; then
+        echo "Some errors occurred..."
+        stop_processes
+        cat server.log
+        cat log/paddle/workerlog.0
+        exit 1
+    fi
+
+    # Health check
+    TIMEOUT=$((11 * 60))
+    INTERVAL=30            # Check interval (seconds)
+    ENDPOINT="http://0.0.0.0:8180/health"
+    START_TIME=$(date +%s) # Record the start timestamp
+    echo "Start the server health check, maximum waiting time: ${TIMEOUT} seconds..."
+    while true; do
+        # Used to calculate the time cost
+        CURRENT_TIME=$(date +%s)
+        ELAPSED=$((CURRENT_TIME - START_TIME))
+
+        # Timeout
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo -e "\nServer start timeout: After $((TIMEOUT/60)) minutes, the service still doesn't start!"
+            stop_processes
+            cat server.log
+            cat log/paddle/workerlog.0
+            exit 1
+        fi
+
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 2 "$ENDPOINT" || true)
+
+        if [ "$HTTP_CODE" = "200" ]; then
+            echo -e "\nThe server was successfully launched! Totally takes $((ELAPSED+90)) seconds."
+            break
+        else
+            sleep $INTERVAL
+        fi
+    done
+
+    echo -e "\n server.log:"
+    cat server.log
+    echo -e "\n"
+}
+
+tensor_parallel_sizes=(1 2)
+quantizations=(wint8 wint4)
+use_cudagraphs=(false true)
+for tensor_parallel_size in "${tensor_parallel_sizes[@]}"; do
+    for quantization in "${quantizations[@]}"; do
+        for use_cudagraph in "${use_cudagraphs[@]}"; do
+            echo "============ Online: start to test ERNIE-4.5-21B-A3B-Paddle (${quantization}, tp=${tensor_parallel_size}, use_cudagraph=${use_cudagraph}) ==========="
+            clear_message
+            echo "Start server..."
+            python -m fastdeploy.entrypoints.openai.api_server \
+                   --model ${MODEL_DIR}/ERNIE-4.5-21B-A3B-Paddle \
+                   --port 8180 \
+                   --tensor-parallel-size ${tensor_parallel_size} \
+                   --quantization ${quantization} \
+                   --max-model-len 32768 \
+                   --max-num-seqs 8 \
+                   --block-size 16 \
+                   --graph-optimization-config "{\"use_cudagraph\": ${use_cudagraph}}" > server.log 2>&1 &
+
+            check_server_status
+
+            echo "Start inference..."
+            cp ${CI_PATH}/test.jsonl ./
+            python3 -u ${CI_PATH}/bench_gsm8k.py --port 8180 --num-questions 10 --num-shots 5 --parallel 8
+
+            exit_code=$?
+            echo -e "\nexit_code is ${exit_code}"
+
+            echo -e "\nStop server..."
+            stop_processes
+            echo -e "\nStop server done."
+
+            if [ ${exit_code} -ne 0 ]; then
+                print_error_message
+                exit 1
+            fi
+
+            acc=`python3 -c "import json; [print(json.loads(line)['latency']) for line in open('result.jsonl')]"`
+            latency=`python3 -c "import json; [print(json.loads(line)['latency']) for line in open('result.jsonl')]"`
+            expected_lowerest_acc=0.8
+            expected_largest_latency=60
+            if awk -v a="$acc" -v b="$expected_lowerest_acc" 'BEGIN {exit !(a < b)}'; then
+                echo -e "\nExit with Accucary error, current accuracy $acc less than $expected_lowerest_acc "
+                exit 1
+            fi
+
+            # if awk -v a="$latency" -v b="$expected_largest_latency" 'BEGIN {exit !(a > b)}'; then
+            #     echo -e "\nExit with Latency Error, current latency $latency greater than $expected_largest_latency "
+            #     exit 1
+            # fi
+            echo -e "\nPASSED"
+        done
+    done
+done
+
+for tensor_parallel_size in "${tensor_parallel_sizes[@]}"; do
+    for quantization in "${quantizations[@]}"; do
+        if [ "${quantization}" = "wint8" ] && [ "${tensor_parallel_size}" -eq 1 ]; then
+            echo -e "\n============ Online: skip ERNIE-4.5-VL-28B-A3B-Paddle (${quantization}, tp=${tensor_parallel_size}) because it may OOM ==========="
+            continue
+        fi
+
+        for use_cudagraph in "${use_cudagraphs[@]}"; do
+            echo -e "\n============ Online: start to test ERNIE-4.5-VL-28B-A3B-Paddle (${quantization}, tp=${tensor_parallel_size}, use_cudagraph=${use_cudagraph}) ==========="
+            clear_message
+            echo "Start server..."
+            python -m fastdeploy.entrypoints.openai.api_server \
+                   --model ${MODEL_DIR}/ERNIE-4.5-VL-28B-A3B-Paddle \
+                   --port 8180 \
+                   --tensor-parallel-size ${tensor_parallel_size} \
+                   --quantization ${quantization} \
+                   --limit-mm-per-prompt '{"image": 100, "video": 100}' \
+                   --reasoning-parser ernie-45-vl \
+                   --max-model-len 32768 \
+                   --max-num-seqs 8 \
+                   --block-size 16 \
+                   --graph-optimization-config "{\"use_cudagraph\": ${use_cudagraph}}" > server.log 2>&1 &
+
+            check_server_status
+
+            echo "Start inference..."
+            result_file="full_response.log"
+
+            curl -X POST "http://0.0.0.0:8180/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "messages": [
+                {"role": "user", "content": [
+                  {"type": "image_url", "image_url": {"url": "https://paddlenlp.bj.bcebos.com/datasets/paddlemix/demo_images/example2.jpg"}},
+                  {"type": "text", "text": "From which era does the artifact in the image originate?"}
+                ]}
+              ],
+              "chat_template_kwargs":{"enable_thinking": false}
+            }' >& $result_file
+
+            exit_code=$?
+            echo -e "\n\nexit_code is ${exit_code}"
+
+            echo -e "\nfull response:"
+            cat $result_file
+
+            echo -e "\nStop server..."
+            stop_processes
+            echo -e "\nStop server done."
+
+            expected_strings="Buddhist"
+            if grep -q "$expected_strings" "$result_file"; then
+                echo -e "\nPASSED"
+            else
+                echo -e "\nExit with Accucary error: '$expected_strings' is not existed in generate response."
+                print_error_message
+                exit 1
+            fi
+        done
+    done
+done
+
+echo -e "\n============ Online: start to test PaddleOCR-VL ==========="
+pip3 install paddleocr[doc-parser]==3.3.2
+
+clear_message
+echo "Start server..."
+python -m fastdeploy.entrypoints.openai.api_server \
+       --model ${MODEL_DIR}/PaddleOCR-VL \
+       --port 8180 \
+       --metrics-port 8471 \
+       --engine-worker-queue-port 8472 \
+       --cache-queue-port 55660 \
+       --max-model-len 16384 \
+       --max-num-batched-tokens 16384 \
+       --max-num-seqs 64 \
+       --workers 2 \
+       --block-size 16 \
+       --graph-optimization-config '{"graph_opt_level":2, "use_cudagraph": true}' > server.log 2>&1 &
+
+check_server_status
+
+echo "Start inference..."
+result_file="full_response.log"
+
+paddleocr doc_parser -i https://paddle-model-ecology.bj.bcebos.com/paddlex/imgs/demo_image/paddleocr_vl_demo.png \
+       --vl_rec_backend fastdeploy-server --vl_rec_server_url http://127.0.0.1:8180/v1 >& $result_file
+
+exit_code=$?
+echo -e "\n\nexit_code is ${exit_code}"
+
+echo -e "\nfull response:"
+cat $result_file
+
+echo -e "\nStop server..."
+stop_processes
+echo -e "\nStop server done."
+
+expected_strings="本报记者 沈小晓 任彦 黄培昭"
+if grep -q "$expected_strings" "$result_file"; then
+    echo -e "\nPASSED"
+else
+    echo -e "\nExit with Accucary error: '$expected_strings' is not existed in generate response."
+    print_error_message
+    exit 1
+fi

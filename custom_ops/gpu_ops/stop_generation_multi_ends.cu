@@ -30,32 +30,77 @@ __global__ void set_value_by_flags(bool *stop_flags,
                                    const int *seq_lens,
                                    const int bs,
                                    const int end_length,
+                                   const int64_t *token_ids_all,
+                                   const int64_t max_model_len,
+                                   const int64_t *prompt_lens,
+                                   const int64_t *step_idx,
+                                   const int64_t *stop_seqs,
+                                   const int *stop_seqs_len,
+                                   const int stop_seqs_bs,
+                                   const int stop_seqs_max_len,
+                                   const int64_t *min_tokens,
                                    bool beam_search,
                                    bool prefill_one_step_stop) {
-    int tid = threadIdx.x;
-    if (tid < bs) {
-        if (prefill_one_step_stop) {
-            stop_flags[tid] = true;
-            if (seq_lens[tid] == 0) {
-                topk_ids[tid] = -1;
-            }
-            next_tokens[tid] = topk_ids[tid];
+  int tid = threadIdx.x;
+  int bid = blockIdx.x;
+  if (tid >= stop_seqs_bs) return;
+  if (bid < bs) {
+    const int64_t current_step = step_idx[bid];
+    const int64_t min_token_limit = min_tokens[bid];
+    const bool can_stop = (current_step >= min_token_limit);
+    if (tid == 0) {
+      if (prefill_one_step_stop) {
+        stop_flags[bid] = true;
+        if (seq_lens[bid] == 0) {
+          topk_ids[bid] = -1;
+        }
+        next_tokens[bid] = topk_ids[bid];
+      } else {
+        if (stop_flags[bid]) {
+          if (seq_lens[bid] == 0) {
+            topk_ids[bid] = -1;
+          } else {
+            topk_ids[bid] = end_ids[0];
+            next_tokens[bid] = end_ids[0];
+          }
         } else {
-            if (stop_flags[tid]) {
-                if (seq_lens[tid] == 0) {
-                    topk_ids[tid] = -1;
-                } else {
-                    topk_ids[tid] = end_ids[0];
-                    next_tokens[tid] = end_ids[0];
-                }
-            } else {
-                next_tokens[tid] = topk_ids[tid];
-            }
+          next_tokens[bid] = topk_ids[bid];
         }
-        if (!beam_search && is_in_end(topk_ids[tid], end_ids, end_length)) {
-            stop_flags[tid] = true;
-        }
+      }
+      if (!beam_search && can_stop &&
+          is_in_end(topk_ids[bid], end_ids, end_length)) {
+        stop_flags[bid] = true;
+        topk_ids[bid] = end_ids[0];
+        next_tokens[bid] = end_ids[0];
+      }
     }
+
+    if (!can_stop) return;
+    // dealing stop_seqs
+    const int stop_seq_len = (stop_seqs_len + bid * stop_seqs_bs)[tid];
+    if (stop_seq_len <= 0) return;
+    const int64_t *stop_seq_now = stop_seqs +
+                                  bid * stop_seqs_bs * stop_seqs_max_len +
+                                  tid * stop_seqs_max_len;
+    const int64_t *pre_ids_now =
+        token_ids_all + bid * max_model_len + prompt_lens[bid];
+    const int64_t step_idx_now = step_idx[bid];
+
+    bool is_end = true;
+    int count = 1;
+    for (int i = stop_seq_len - 1; i >= 0; --i) {
+      if ((step_idx_now - count) < 0 ||
+          pre_ids_now[step_idx_now - count++] != stop_seq_now[i]) {
+        is_end = false;
+        break;
+      }
+    }
+    if (is_end) {
+      next_tokens[bid] = end_ids[0];
+      stop_flags[bid] = true;
+      topk_ids[bid] = end_ids[0];
+    }
+  }
 }
 
 void GetStopFlagsMulti(const paddle::Tensor &topk_ids,
@@ -63,36 +108,71 @@ void GetStopFlagsMulti(const paddle::Tensor &topk_ids,
                        const paddle::Tensor &seq_lens,
                        const paddle::Tensor &end_ids,
                        const paddle::Tensor &next_tokens,
+                       const paddle::Tensor &token_ids_all,
+                       const paddle::Tensor &prompt_lens,
+                       const paddle::Tensor &step_idx,
+                       const paddle::Tensor &stop_seqs,
+                       const paddle::Tensor &stop_seqs_len,
+                       const paddle::Tensor &min_tokens,
                        const bool beam_search) {
-    PD_CHECK(topk_ids.dtype() == paddle::DataType::INT64);
-    PD_CHECK(stop_flags.dtype() == paddle::DataType::BOOL);
-    bool prefill_one_step_stop = false;
-    if (const char *env_p = std::getenv("PREFILL_NODE_ONE_STEP_STOP")) {
-        // std::cout << "Your PATH is: " << env_p << '\n';
-        if (env_p[0] == '1') {
-            prefill_one_step_stop = true;
-        }
+  PD_CHECK(topk_ids.dtype() == paddle::DataType::INT64);
+  PD_CHECK(stop_flags.dtype() == paddle::DataType::BOOL);
+  bool prefill_one_step_stop = false;
+  if (const char *env_p = std::getenv("PREFILL_NODE_ONE_STEP_STOP")) {
+    // std::cout << "Your PATH is: " << env_p << '\n';
+    if (env_p[0] == '1') {
+      prefill_one_step_stop = true;
     }
+  }
 
-    auto cu_stream = topk_ids.stream();
-    std::vector<int64_t> shape = topk_ids.shape();
-    int64_t bs_now = shape[0];
-    int64_t end_length = end_ids.shape()[0];
-    int block_size = (bs_now + 32 - 1) / 32 * 32;
-    set_value_by_flags<<<1, block_size, 0, cu_stream>>>(
-        const_cast<bool *>(stop_flags.data<bool>()),
-        const_cast<int64_t *>(topk_ids.data<int64_t>()),
-        const_cast<int64_t *>(next_tokens.data<int64_t>()),
-        end_ids.data<int64_t>(),
-        seq_lens.data<int>(),
-        bs_now,
-        end_length,
-        beam_search,
-        prefill_one_step_stop);
+#ifdef PADDLE_WITH_CUSTOM_DEVICE
+  auto dev_ctx = static_cast<const phi::CustomContext *>(
+      paddle::experimental::DeviceContextPool::Instance().Get(
+          topk_ids.place()));
+  auto cu_stream = dev_ctx->stream();
+#else
+  auto cu_stream = topk_ids.stream();
+#endif
+  std::vector<int64_t> shape = topk_ids.shape();
+  int64_t bs_now = shape[0];
+  int64_t end_length = end_ids.shape()[0];
+  int stop_seqs_bs = stop_seqs.shape()[1];
+  int stop_seqs_max_len = stop_seqs.shape()[2];
+  int64_t max_model_len = token_ids_all.shape()[1];
+  int block_size = (stop_seqs_bs + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
+  set_value_by_flags<<<bs_now, block_size, 0, cu_stream>>>(
+      const_cast<bool *>(stop_flags.data<bool>()),
+      const_cast<int64_t *>(topk_ids.data<int64_t>()),
+      const_cast<int64_t *>(next_tokens.data<int64_t>()),
+      end_ids.data<int64_t>(),
+      seq_lens.data<int>(),
+      bs_now,
+      end_length,
+      token_ids_all.data<int64_t>(),
+      max_model_len,
+      prompt_lens.data<int64_t>(),
+      step_idx.data<int64_t>(),
+      stop_seqs.data<int64_t>(),
+      stop_seqs_len.data<int>(),
+      stop_seqs_bs,
+      stop_seqs_max_len,
+      min_tokens.data<int64_t>(),
+      beam_search,
+      prefill_one_step_stop);
 }
 
 PD_BUILD_STATIC_OP(set_stop_value_multi_ends)
-    .Inputs({"topk_ids", "stop_flags", "seq_lens", "end_ids", "next_tokens"})
+    .Inputs({"topk_ids",
+             "stop_flags",
+             "seq_lens",
+             "end_ids",
+             "next_tokens",
+             "token_ids_all",
+             "prompt_lens",
+             "step_idx",
+             "stop_seqs",
+             "stop_seqs_len",
+             "min_tokens"})
     .Attrs({"beam_search: bool"})
     .Outputs({"topk_ids_out", "stop_flags_out", "next_tokens_out"})
     .SetInplaceMap({{"topk_ids", "topk_ids_out"},

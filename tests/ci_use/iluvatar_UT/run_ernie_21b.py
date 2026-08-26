@@ -1,0 +1,61 @@
+# Copyright (c) 2025  PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import sys
+
+from fastdeploy import LLM, SamplingParams
+from fastdeploy.utils import set_random_seed
+
+tests_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, tests_dir)
+
+from ci_use.iluvatar_UT.utils import timeout
+
+
+@timeout(240)
+def offline_infer_check():
+    set_random_seed(123)
+
+    prompts = [
+        "The largest ocean is",
+    ]
+    sampling_params = SamplingParams(temperature=0.8, top_p=0.00001, max_tokens=128)
+    graph_optimization_config = {"use_cudagraph": False}
+    llm = LLM(
+        model="/model_data/ERNIE-4.5-21B-A3B-Paddle",
+        tensor_parallel_size=2,
+        max_model_len=8192,
+        quantization="wint8",
+        block_size=16,
+        graph_optimization_config=graph_optimization_config,
+    )
+    outputs = llm.generate(prompts, sampling_params)
+
+    for output in outputs:
+        generated_text = output.outputs.text
+        print(f"generated_text={generated_text}")
+        assert "pacific ocean" in generated_text.lower()
+
+    print("PASSED")
+
+
+if __name__ == "__main__":
+    try:
+        result = offline_infer_check()
+        sys.exit(0)
+    except TimeoutError:
+        sys.exit(124)
+    except Exception:
+        sys.exit(1)

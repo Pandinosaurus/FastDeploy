@@ -13,33 +13,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
+
 import importlib
 import inspect
 import os
+from pathlib import Path
+
+from paddleformers.transformers.model_utils import PretrainedModel
+
+from fastdeploy.plugins.model_register import load_model_register_plugins
 
 from .model_base import ModelForCasualLM, ModelRegistry
 
-inference_runner_supported_models = ["Qwen2ForCausalLM"]
+
+def _find_py_files(root_dir):
+    root_path = Path(root_dir)
+    py_files = []
+    for py_file in root_path.rglob("*.py"):
+        rel_path = py_file.relative_to(root_dir)
+        if "__init__" in str(py_file):
+            continue
+        dotted_path = str(rel_path).replace("/", ".").replace("\\", ".").replace(".py", "")
+        py_files.append(dotted_path)
+    return py_files
 
 
-def auto_models_registry():
+def auto_models_registry(dir_path, register_path="fastdeploy.model_executor.models"):
     """
     auto registry all models in this folder
     """
-    for module_file in os.listdir(os.path.dirname(__file__)):
-        if module_file.endswith('.py') and module_file != '__init__.py':
-            module_name = module_file[:-3]
-            try:
-                module = importlib.import_module(
-                    f'fastdeploy.model_executor.models.{module_name}')
-                for attr_name in dir(module):
-                    attr = getattr(module, attr_name)
-                    if inspect.isclass(attr) and issubclass(
-                            attr,
-                            ModelForCasualLM) and attr is not ModelForCasualLM:
-                        ModelRegistry.register(attr)
-            except ImportError:
-                raise ImportError(f"{module_name=} import error")
+    for module_file in _find_py_files(dir_path):
+        try:
+            module = importlib.import_module(f"{register_path}.{module_file}")
+            for attr_name in dir(module):
+                attr = getattr(module, attr_name)
+
+                if inspect.isclass(attr) and issubclass(attr, ModelForCasualLM) and attr is not ModelForCasualLM:
+                    ModelRegistry.register_model_class(attr)
+
+                if (
+                    inspect.isclass(attr)
+                    and issubclass(attr, PretrainedModel)
+                    and attr is not PretrainedModel
+                    and hasattr(attr, "arch_name")
+                ):
+                    ModelRegistry.register_pretrained_model(attr)
+
+        except Exception as e:
+            raise ImportError(f"{module_file=} import error, error message: {e}")
 
 
-auto_models_registry()
+auto_models_registry(os.path.dirname(__file__))
+
+load_model_register_plugins()

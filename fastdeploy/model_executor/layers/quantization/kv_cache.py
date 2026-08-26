@@ -13,11 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-from paddle import nn
-import os
-import paddle
-from .quant_base import QuantConfigBase, QuantMethodBase
+
+from enum import Enum
 from typing import Optional
+
+import paddle
+from paddle import nn
+
+from fastdeploy.model_executor.layers.utils import get_tensor
+from fastdeploy.model_executor.utils import set_weight_attrs
+from fastdeploy.platforms import current_platform
+
+from .quant_base import QuantConfigBase, QuantMethodBase
+
+
+class KvCacheQuantzationTypes(str, Enum):
+    """
+    KvCacheQuantzationTypes
+    """
+
+    INT8 = "int8"
+    FP8 = "float8_e4m3fn"
+    FP8_E4M3 = "float8_e4m3"
+    BLOCK_WISE_FP8 = "block_wise_fp8"
+    INT8_ZP = "int8_zp"
+    INT4_ZP = "int4_zp"
+    FP8_ZP = "float8_e4m3fn_zp"
 
 
 class KvCacheQuantConfig(QuantConfigBase):
@@ -25,32 +46,72 @@ class KvCacheQuantConfig(QuantConfigBase):
     quantization config for weight 4bits and activation fp8
     """
 
-    def __init__(self, cachekv_scale_dict) -> None:
+    def __init__(self, kv_cache_quant_type: str, is_channel_wise: bool, has_zero_point: bool) -> None:
         """
         __init__
         """
         super().__init__()
-        self.cachekv_scale_dict = cachekv_scale_dict
+        self.kv_cache_quant_type = kv_cache_quant_type
+        self.is_channel_wise = is_channel_wise
+        self.has_zero_point = has_zero_point
 
-    def get_name(self) -> str:
+        try:
+            self.quant_type = KvCacheQuantzationTypes(kv_cache_quant_type)
+        except ValueError:
+            raise ValueError(f"Invalid Kvcache type: {kv_cache_quant_type}")
+
+        if "zp" in kv_cache_quant_type:
+            self.has_zero_point = True
+
+        if self.quant_type == KvCacheQuantzationTypes.INT8 or self.quant_type == KvCacheQuantzationTypes.INT8_ZP:
+            self.max_bound = 127.0
+            self.is_channel_wise = True
+        elif self.quant_type == KvCacheQuantzationTypes.FP8_E4M3:
+            self.max_bound = 240.0
+        elif (
+            self.quant_type == KvCacheQuantzationTypes.FP8
+            or self.quant_type == KvCacheQuantzationTypes.FP8_ZP
+            or self.quant_type == KvCacheQuantzationTypes.BLOCK_WISE_FP8
+        ):
+            self.max_bound = 448.0
+        elif self.quant_type == KvCacheQuantzationTypes.INT4_ZP:
+            self.max_bound = 7.0
+        else:
+            raise ValueError(f"Invalid Kvcache type: {kv_cache_quant_type}")
+
+    def name(self) -> str:
         """
         get_name
         """
         return "kvcache"
 
     @classmethod
-    def from_config(cls, config: dict) -> "KvCacheQuantConfig":
+    def from_config(
+        cls, kv_cache_quant_type: str, is_channel_wise: bool, has_zero_point: bool
+    ) -> "KvCacheQuantConfig":
         """
         from_config
         """
-        cachekv_scale_dict = config["cachekv_scale_dict"]
-        return cls(cachekv_scale_dict)
+        return cls(kv_cache_quant_type, is_channel_wise, has_zero_point)
 
     def get_quant_method(self, layer) -> Optional[QuantMethodBase]:
         """
         get_quant_method
         """
-        return KVCacheMethodBase(self)
+        if current_platform.is_xpu():
+            from fastdeploy.model_executor.layers.backends.xpu.quantization.kv_cache import (
+                XPUKVCacheMethodBase,
+            )
+
+            return XPUKVCacheMethodBase(self)
+        elif current_platform.is_intel_hpu():
+            from fastdeploy.model_executor.layers.backends.intel_hpu.quantization.kv_cache import (
+                HPUKVCacheMethodBase,
+            )
+
+            return HPUKVCacheMethodBase(self)
+        else:
+            return KVCacheMethodBase(self)
 
 
 class KVCacheMethodBase(QuantMethodBase):
@@ -66,202 +127,159 @@ class KVCacheMethodBase(QuantMethodBase):
         KVCacheMethodBase __init__
         """
         super().__init__()
-        self.quant_config = quant_config
+        self.cache_quant_config = quant_config
 
-    def load_zp(self, layer: nn.Layer):
+    def load_zp(self, layer: nn.Layer, state_dict):
         """
         load_zp
         """
-        if self.cache_k_zp_name in self.quant_config.cachekv_scale_dict:
-            cache_k_zp = paddle.cast(
-                paddle.to_tensor(
-                    self.quant_config.cachekv_scale_dict[self.cache_k_zp_name]
-                ),
-                self.cache_scale_dtype,
-            )
-        else:
-            cache_k_zp = paddle.zeros(
-                (
-                    [self.kv_num_heads * self.head_dim]
-                    if self.quant_config.is_channel_wise
-                    else [self.kv_num_heads]
-                ),
-                dtype=self.cache_scale_dtype,
-            )
-        if self.cache_v_zp_name in self.quant_config.cachekv_scale_dict:
-            cache_v_zp = paddle.cast(
-                paddle.to_tensor(
-                    self.quant_config.cachekv_scale_dict[self.cache_v_zp_name]
-                ),
-                self.cache_scale_dtype,
-            )
-        else:
-            cache_v_zp = paddle.zeros(
-                (
-                    [self.kv_num_heads * self.head_dim]
-                    if self.quant_config.is_channel_wise
-                    else [self.kv_num_heads]
-                ),
-                dtype=self.cache_scale_dtype,
-            )
-        layer.cache_k_zp.set_value(cache_k_zp)
-        layer.cache_v_zp.set_value(cache_v_zp)
+        cache_k_zeropoint = get_tensor(state_dict.pop(self.cache_k_zp_name)).cast(paddle.get_default_dtype())
+        cache_v_zeropoint = get_tensor(state_dict.pop(self.cache_v_zp_name)).cast(paddle.get_default_dtype())
 
-    def load_scale(self, layer: nn.Layer):
+        layer.cache_k_zp.set_value(cache_k_zeropoint)
+        layer.cache_v_zp.set_value(cache_v_zeropoint)
+
+    def load_scale(self, layer: nn.Layer, state_dict):
         """
         load_scale
         """
-        if self.cache_k_scale_name in self.quant_config.cachekv_scale_dict:
-            cache_k_scale = paddle.cast(
-                paddle.to_tensor(
-                    self.quant_config.cachekv_scale_dict[self.cache_k_scale_name]
-                ),
-                self.cache_scale_dtype,
-            )
-            cache_k_out_scale = 1.0 / cache_k_scale
-        else:
-            raise KeyError(
-                f"{self.cache_k_scale_name} not found in scale dict")
+        cache_k_scale_tensor = (
+            get_tensor(state_dict.pop(self.cache_k_scale_name)).cast(paddle.get_default_dtype()).reshape_([-1])
+        )
+        cache_v_scale_tensor = (
+            get_tensor(state_dict.pop(self.cache_v_scale_name)).cast(paddle.get_default_dtype()).reshape_([-1])
+        )
 
-        if self.cache_v_scale_name in self.quant_config.cachekv_scale_dict:
-            cache_v_scale = paddle.cast(
-                paddle.to_tensor(
-                    self.quant_config.cachekv_scale_dict[self.cache_v_scale_name]
-                ),
-                self.cache_scale_dtype,
-            )
-            cache_v_out_scale = 1.0 / cache_v_scale
+        if self.cache_quant_config.has_zero_point:  # cache_int4_zp
+            cache_k_scale = 1.0 / cache_k_scale_tensor
+            cache_v_scale = 1.0 / cache_v_scale_tensor
+            cache_k_out_scale = cache_k_scale_tensor
+            cache_v_out_scale = cache_v_scale_tensor
         else:
-            raise KeyError(
-                f"{self.cache_v_scale_name} not found in scale dict")
-
-        if self.cache_v_scale_name in self.quant_config.cachekv_scale_dict:
-            cache_v_scale = paddle.cast(
-                paddle.to_tensor(
-                    self.quant_config.cachekv_scale_dict[self.cache_v_scale_name]
-                ),
-                self.cache_scale_dtype,
-            )
-            cache_v_out_scale = 1.0 / cache_v_scale
-        else:
-            raise KeyError(
-                f"{self.cache_v_scale_name} not found in scale dict")
+            cache_k_scale = self.cache_quant_config.max_bound / cache_k_scale_tensor
+            cache_v_scale = self.cache_quant_config.max_bound / cache_v_scale_tensor
+            cache_k_out_scale = cache_k_scale_tensor / self.cache_quant_config.max_bound
+            cache_v_out_scale = cache_v_scale_tensor / self.cache_quant_config.max_bound
 
         layer.cache_k_scale.set_value(cache_k_scale)
         layer.cache_v_scale.set_value(cache_v_scale)
         layer.cache_k_out_scale.set_value(cache_k_out_scale)
         layer.cache_v_out_scale.set_value(cache_v_out_scale)
 
-    def create_scale(self, layer: nn.Layer):
-        """
-        create_scale
-        """
-        layer.cache_k_scale = layer.create_parameter(
-            shape=(
-                [layer.kv_num_heads * layer.head_dim]
-                if self.quant_config.is_channel_wise
-                else [layer.kv_num_heads]
-            ),
-            dtype=self.cache_scale_dtype,
-            is_bias=False,
-        )
-        layer.cache_v_scale = layer.create_parameter(
-            shape=(
-                [layer.kv_num_heads * layer.head_dim]
-                if self.quant_config.is_channel_wise
-                else [layer.kv_num_heads]
-            ),
-            dtype=self.cache_scale_dtype,
-            is_bias=False,
-        )
-        layer.cache_k_out_scale = layer.create_parameter(
-            shape=(
-                [layer.kv_num_heads * layer.head_dim]
-                if self.quant_config.is_channel_wise
-                else [layer.kv_num_heads]
-            ),
-            attr=None,
-            dtype=self.cache_scale_dtype,
-            is_bias=False,
-        )
-        layer.cache_v_out_scale = layer.create_parameter(
-            shape=(
-                [layer.kv_num_heads * layer.head_dim]
-                if self.quant_config.is_channel_wise
-                else [layer.kv_num_heads]
-            ),
-            attr=None,
-            dtype=self.cache_scale_dtype,
-            is_bias=False,
-        )
-
-    def create_zp(self, layer: nn.Layer):
-        """
-        create_zp
-        """
-        layer.cache_k_zp = layer.create_parameter(
-            shape=(
-                [layer.kv_num_heads * layer.head_dim]
-                if self.quant_config.is_channel_wise
-                else [layer.kv_num_heads]
-            ),
-            dtype=self.cache_scale_dtype,
-            is_bias=False,
-        )
-        layer.cache_v_zp = layer.create_parameter(
-            shape=(
-                [layer.kv_num_heads * layer.head_dim]
-                if self.quant_config.is_channel_wise
-                else [layer.kv_num_heads]
-            ),
-            dtype=self.cache_scale_dtype,
-            is_bias=False,
-        )
-
-    def create_weights(self, layer: nn.Layer):
+    def create_weights(self, layer: nn.Layer, **extra_weight_attrs):
         """
         create_weights
         """
-        self.prefix = layer.prefix
-        self.cache_k_scale_name = layer.prefix + ".cachek_matmul.activation_quanter"
-        self.cache_v_scale_name = layer.prefix + ".cachev_matmul.activation_quanter"
-        self.cache_k_zp_name = layer.cache_k_scale_name + ".zero_point"
-        self.cache_v_zp_name = layer.cache_v_scale_name + ".zero_point"
+        if self.cache_quant_config.quant_type == KvCacheQuantzationTypes.INT8:
+            layer.cache_quant_type_str = "cache_int8"
+            layer.quant_max_bound = 127.0
+            layer.quant_min_bound = -127.0
+        elif self.cache_quant_config.quant_type == KvCacheQuantzationTypes.FP8:
+            layer.cache_quant_type_str = "cache_fp8"
+            layer.quant_max_bound = 448.0
+            layer.quant_min_bound = -448.0
+        elif self.cache_quant_config.quant_type == KvCacheQuantzationTypes.INT4_ZP:
+            layer.cache_quant_type_str = "cache_int4_zp"
+            layer.quant_max_bound = 7.0
+            layer.quant_min_bound = -7.0
+        elif self.cache_quant_config.quant_type == KvCacheQuantzationTypes.BLOCK_WISE_FP8:
+            layer.cache_quant_type_str = "block_wise_fp8"
+            layer.quant_max_bound = 448.0
+            layer.quant_min_bound = -448.0
+        else:
+            raise NotImplementedError(f"{self.cache_quant_config.quant_type} is not implemented")
 
-        layer.cache_k_zp = None
-        layer.cache_v_zp = None
-        layer.cache_k_scale = None
-        layer.cache_v_scale = None
-        layer.cache_k_out_scale = None
-        layer.cache_v_out_scale = None
+        if "block_wise" not in layer.cache_quant_type_str:  # dynamic cache kv block_wise_fp8 not need
+            scale_shape = [layer.fd_config.model_config.num_key_value_heads]
+            if self.cache_quant_config.is_channel_wise:
+                scale_shape = [layer.kv_num_heads * layer.head_dim]
 
-        self._dtype = layer._dtype
-        if self._dtype != "bfloat16" and self._dtype != "float16" and self._dtype == "float32":
-            raise ValueError(
-                f"Just support float32, float16 and \
-                    bfloat16 as default dtype, but received {self._dtype}"
+            layer.cache_k_scale = layer.create_parameter(
+                shape=scale_shape,
+                dtype=paddle.get_default_dtype(),
+                default_initializer=paddle.nn.initializer.Constant(0),
             )
-        self.cache_scale_dtype = (
-            self._dtype if self.quant_config.use_append_attn else "float32"
-        )
+            layer.cache_v_scale = layer.create_parameter(
+                shape=scale_shape,
+                dtype=paddle.get_default_dtype(),
+                default_initializer=paddle.nn.initializer.Constant(0),
+            )
 
-        if not self.quant_config.use_dynamic_cachekv_quant:
-            if (
-                self.quant_config.cachekv_dtype == "int8"
-                or self.quant_config.cachekv_dtype == "int4"
-                or self.quant_config.cachekv_dtype == "float8_e4m3fn"
-            ):
-                self.create_scale(layer)
-                self.load_scale(layer)
-                if self.quant_config.has_zero_point:
-                    self.create_zp(layer)
-                    self.load_zp(layer)
-        layer.cache_quant_type_str = self.quant_config.cache_quant_type
+            set_weight_attrs(
+                layer.cache_k_scale,
+                {
+                    **extra_weight_attrs,
+                },
+            )
+            set_weight_attrs(
+                layer.cache_v_scale,
+                {
+                    **extra_weight_attrs,
+                },
+            )
+
+            layer.cache_k_out_scale = layer.create_parameter(
+                shape=scale_shape,
+                dtype=paddle.get_default_dtype(),
+                default_initializer=paddle.nn.initializer.Constant(0),
+            )
+            layer.cache_v_out_scale = layer.create_parameter(
+                shape=scale_shape,
+                dtype=paddle.get_default_dtype(),
+                default_initializer=paddle.nn.initializer.Constant(0),
+            )
+
+            if self.cache_quant_config.has_zero_point:
+                layer.cache_k_zp = layer.create_parameter(
+                    shape=scale_shape,
+                    dtype=paddle.get_default_dtype(),
+                    default_initializer=paddle.nn.initializer.Constant(0),
+                )
+                layer.cache_v_zp = layer.create_parameter(
+                    shape=scale_shape,
+                    dtype=paddle.get_default_dtype(),
+                    default_initializer=paddle.nn.initializer.Constant(0),
+                )
+                set_weight_attrs(
+                    layer.cache_k_zp,
+                    {
+                        **extra_weight_attrs,
+                    },
+                )
+                set_weight_attrs(
+                    layer.cache_v_zp,
+                    {
+                        **extra_weight_attrs,
+                    },
+                )
+
+    def process_loaded_weights(self, layer: nn.Layer, state_dict):
+        """
+        use for loader v0
+        """
+        self.prefix = layer.prefix
+        self.cache_k_scale_name = layer.prefix + ".cachek_matmul.activation_scale"
+        self.cache_v_scale_name = layer.prefix + ".cachev_matmul.activation_scale"
+        self.cache_k_zp_name = layer.prefix + ".cachek_matmul.activation_zero_point"
+        self.cache_v_zp_name = layer.prefix + ".cachev_matmul.activation_zero_point"
+
+        if "block_wise" not in layer.cache_quant_type_str:
+            self.load_scale(layer, state_dict)
+            if self.cache_quant_config.has_zero_point:
+                self.load_zp(layer, state_dict)
+
+    def process_weights_after_loading(self, layer: nn.Layer):
+        """
+        use for loader v1
+        """
+        if "block_wise" not in layer.cache_quant_type_str:
+            if layer.cache_k_scale._is_initialized():
+                layer.cache_k_out_scale.set_value(1 / layer.cache_k_scale)
+            if layer.cache_v_scale._is_initialized():
+                layer.cache_v_out_scale.set_value(1 / layer.cache_v_scale)
 
     def apply(self, layer):
         """
         apply
         """
-        raise RuntimeError(
-            f"{self.__class__.__name__}.apply should not be called.")
-
+        raise RuntimeError(f"{self.__class__.__name__}.apply should not be called.")

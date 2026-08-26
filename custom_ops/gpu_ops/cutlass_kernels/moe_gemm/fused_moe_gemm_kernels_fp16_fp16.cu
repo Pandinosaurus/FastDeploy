@@ -21,6 +21,8 @@
 
 namespace phi {
 
-template class MoeGemmRunner<half, half>;
+template class MoeGemmRunner<
+    half,
+    cutlass::WintQuantTraits<half, cutlass::WintQuantMethod::kNone>>;
 
 }  // namespace phi

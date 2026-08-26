@@ -16,14 +16,56 @@
 all backends methods
 """
 
-from .xpu import *
-from .npu import *
+from fastdeploy.platforms import current_platform
 
 __all__ = []
-from . import npu
-if hasattr(npu, '__all__'):
-    __all__.extend(npu.__all__)
-    
-from . import xpu
-if hasattr(xpu, '__all__'):
-    __all__.extend(xpu.__all__)
+
+if current_platform.is_xpu():
+    from . import xpu
+
+    # fix: F403 `from .xpu import *` used; unable to detect undefined names
+    if hasattr(xpu, "__all__"):
+        globals().update({name: getattr(xpu, name) for name in xpu.__all__})
+        __all__.extend(xpu.__all__)
+
+if current_platform.is_npu():
+    from . import npu
+
+    if hasattr(npu, "__all__"):
+        globals().update({name: getattr(npu, name) for name in npu.__all__})
+        __all__.extend(npu.__all__)
+
+if current_platform.is_gcu():
+    from . import gcu
+
+    if hasattr(gcu, "__all__"):
+        globals().update({name: getattr(gcu, name) for name in gcu.__all__})
+        __all__.extend(gcu.__all__)
+
+if current_platform.is_dcu():
+    from . import dcu
+
+    if hasattr(dcu, "__all__"):
+        globals().update({name: getattr(dcu, name) for name in dcu.__all__})
+        __all__.extend(dcu.__all__)
+
+if current_platform.is_maca():
+    from . import metax
+
+    if hasattr(metax, "__all__"):
+        globals().update({name: getattr(metax, name) for name in metax.__all__})
+        __all__.extend(metax.__all__)
+
+if current_platform.is_intel_hpu():
+    from . import intel_hpu
+
+    if hasattr(intel_hpu, "__all__"):
+        globals().update({name: getattr(intel_hpu, name) for name in intel_hpu.__all__})
+        __all__.extend(intel_hpu.__all__)
+
+if current_platform.is_iluvatar():
+    from . import iluvatar
+
+    if hasattr(iluvatar, "__all__"):
+        globals().update({name: getattr(iluvatar, name) for name in iluvatar.__all__})
+        __all__.extend(iluvatar.__all__)

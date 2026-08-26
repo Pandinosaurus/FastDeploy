@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" fastdeploy cpu ops """
+"""fastdeploy cpu ops"""
 
 from fastdeploy.import_ops import import_custom_ops, rename_imported_op
 
 PACKAGE = "fastdeploy.model_executor.ops.cpu"
 
-import_custom_ops(PACKAGE, "..base.fastdeploy_base_ops", globals())
 import_custom_ops(PACKAGE, ".fastdeploy_cpu_ops", globals())
 
 rename_imported_op(

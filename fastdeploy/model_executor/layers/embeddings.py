@@ -14,11 +14,85 @@
 # limitations under the License.
 """
 
+from dataclasses import dataclass
+from typing import Dict
+
+import numpy as np
 import paddle
 from paddle import nn
 from paddle.distributed import fleet
 
-from .utils import get_tensor
+import fastdeploy.envs as envs
+from fastdeploy.config import FDConfig
+from fastdeploy.model_executor.forward_meta import ForwardMeta
+from fastdeploy.model_executor.utils import h2d_copy, set_weight_attrs, slice_fn
+from fastdeploy.platforms import current_platform
+
+from .utils import (
+    DEFAULT_VOCAB_PADDING_SIZE,
+    get_tensor,
+    pad_vocab_size,
+    vocab_range_from_global_vocab_size,
+)
+
+
+@dataclass
+class VocabParallelEmbeddingShardIndices:
+    """Indices for a shard of a vocab parallel embedding."""
+
+    padded_org_vocab_start_index: int
+    padded_org_vocab_end_index: int
+    padded_added_vocab_start_index: int
+    padded_added_vocab_end_index: int
+
+    org_vocab_start_index: int
+    org_vocab_end_index: int
+    added_vocab_start_index: int
+    added_vocab_end_index: int
+
+    @property
+    def num_org_elements(self) -> int:
+        return self.org_vocab_end_index - self.org_vocab_start_index
+
+    @property
+    def num_added_elements(self) -> int:
+        return self.added_vocab_end_index - self.added_vocab_start_index
+
+    @property
+    def num_org_elements_padded(self) -> int:
+        return self.padded_org_vocab_end_index - self.padded_org_vocab_start_index
+
+    @property
+    def num_added_elements_padded(self) -> int:
+        return self.padded_added_vocab_end_index - self.padded_added_vocab_start_index
+
+    @property
+    def num_org_vocab_padding(self) -> int:
+        return self.num_org_elements_padded - self.num_org_elements
+
+    @property
+    def num_added_vocab_padding(self) -> int:
+        return self.num_added_elements_padded - self.num_added_elements
+
+    @property
+    def num_elements_padded(self) -> int:
+        return self.num_org_elements_padded + self.num_added_elements_padded
+
+    def __post_init__(self):
+        # sanity checks
+        assert self.padded_org_vocab_start_index <= self.padded_org_vocab_end_index
+        assert self.padded_added_vocab_start_index <= self.padded_added_vocab_end_index
+
+        assert self.org_vocab_start_index <= self.org_vocab_end_index
+        assert self.added_vocab_start_index <= self.added_vocab_end_index
+
+        assert self.org_vocab_start_index <= self.padded_org_vocab_start_index
+        assert self.added_vocab_start_index <= self.padded_added_vocab_start_index
+        assert self.org_vocab_end_index <= self.padded_org_vocab_end_index
+        assert self.added_vocab_end_index <= self.padded_added_vocab_end_index
+
+        assert self.num_org_elements <= self.num_org_elements_padded
+        assert self.num_added_elements <= self.num_added_elements_padded
 
 
 class VocabParallelEmbedding(nn.Layer):
@@ -28,121 +102,197 @@ class VocabParallelEmbedding(nn.Layer):
 
     def __init__(
         self,
-        llm_config,
-        num_embeddings,
-        embedding_dim=768,
-        params_dtype="bfloat16",
+        fd_config: FDConfig,
+        num_embeddings: int,
+        embedding_dim: int = 768,
+        params_dtype: str = "bfloat16",
         prefix="",
-    ):
+        padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
+        org_num_embeddings: int | None = None,
+        general=False,
+    ) -> None:
         """
         Initialize the VocabParallelEmbedding layer for the model.
 
         Args:
-            llm_config (LLMConfig): Arguments related to inference, containing
+            fd_config (FDConfig): Arguments related to inference, containing
                 attributes such as weight_dtype, act_dtype, mp_size, hidden_size, head_dim,
                 num_attention_heads, and ffn_hidden_size.
-            num_embeddings : vocabulary size.
-            embedding_dim : size of hidden state.
-            params_dtype : data type of parameters.
-            prefix (str): Unique name of the layer, used for naming internal attributes,
-                you can give it any name you like.
+            num_embeddings (int)  : vocabulary size.
+            embedding_dim (int) : size of hidden state.
+            params_dtype  (str) : data type of parameters.
+            prefix (str): The name of current layer. Defaults to "".
         """
         super().__init__()
+        self.fd_config = fd_config
         hcg = fleet.get_hybrid_communicate_group()
-        self.mp_rank = hcg.get_model_parallel_rank()
-        self.column_cut = llm_config.parallel_config.column_cut
-        self.world_size = hcg.get_model_parallel_world_size()
-        self.ring_id = hcg.get_model_parallel_group().id
-        self.use_rope = llm_config.model_config.use_rope
-        self.rope_head_dim = llm_config.model_config.rope_head_dim
-        self.use_ep = llm_config.parallel_config.use_ep
-        self.hidden_dropout_prob = llm_config.model_config.hidden_dropout_prob
-        self.initializer_range = llm_config.model_config.initializer_range
-        self.weight_sharing = llm_config.model_config.weight_sharing
-        self.sequence_parallel = llm_config.parallel_config.sequence_parallel
-        self.weight_sharing_add_bias = llm_config.model_config.weight_sharing_add_bias
-        self.max_position_embeddings = llm_config.model_config.max_position_embeddings
-        self.freeze_embedding = llm_config.model_config.freeze_embedding
+        self.mp_rank: int = hcg.get_model_parallel_rank()
+        self.column_cut = False
+        self.world_size: int = fd_config.parallel_config.tensor_parallel_size
+        self.tensor_parallel_rank = fd_config.parallel_config.tensor_parallel_rank
+        self.tp_group = fd_config.parallel_config.tp_group
+        self.hidden_dropout_prob: float = fd_config.model_config.hidden_dropout_prob
+        self.initializer_range: float = fd_config.model_config.initializer_range
+        self.max_position_embeddings: int = fd_config.model_config.max_position_embeddings
+        self.tie_word_embeddings: bool = fd_config.model_config.tie_word_embeddings
+        self.params_dtype: str = params_dtype
 
-        if self.use_ep:
-            self.word_embeddings = nn.Embedding(
-                num_embeddings,
-                embedding_dim,
-            )
+        self.embedding_dim = embedding_dim
+
+        self.general = general  # used for general Embedding
+        self.num_embeddings = num_embeddings
+        self.padding_size = padding_size
+        if self.general:
+            self.org_vocab_size = num_embeddings
+            self.num_embeddings_padded = num_embeddings
+            self.org_vocab_size_padded = num_embeddings
         else:
-            if not self.column_cut:
-                self.word_embeddings = fleet.meta_parallel.VocabParallelEmbedding(
-                    num_embeddings,
-                    embedding_dim,
-                    mp_group=fleet.get_hybrid_communicate_group().
-                    get_model_parallel_group(),
-                    weight_attr=paddle.ParamAttr(
-                        initializer=nn.initializer.Normal(
-                            mean=0.0, std=self.initializer_range),
-                    ),
-                )
-            else:
-                # column cut embedding
-                self.word_embeddings = nn.Embedding(
-                    num_embeddings,
-                    embedding_dim // self.world_size,
-                )
-                self.word_embeddings.weight.is_distributed = True
-                self.word_embeddings.weight.split_axis = 1
+            self.org_vocab_size = org_num_embeddings or num_embeddings
+            num_added_embeddings = num_embeddings - self.org_vocab_size
 
-        if not self.use_rope:
-            self.position_embeddings = nn.Embedding(
-                self.max_position_embeddings,
+            self.org_vocab_size_padded = pad_vocab_size(self.org_vocab_size, self.padding_size)
+            self.num_embeddings_padded = pad_vocab_size(
+                self.org_vocab_size_padded + num_added_embeddings, self.padding_size
+            )
+            assert self.org_vocab_size_padded <= self.num_embeddings_padded
+        self.shard_indices = self._get_indices(
+            self.num_embeddings_padded,
+            self.org_vocab_size_padded,
+            self.num_embeddings,
+            self.org_vocab_size,
+            self.tensor_parallel_rank,
+            self.world_size,
+        )
+
+        if not self.column_cut:
+            self.embeddings = fleet.meta_parallel.VocabParallelEmbedding(
+                self.num_embeddings_padded,
                 embedding_dim,
+                mp_group=self.tp_group,
                 weight_attr=paddle.ParamAttr(
-                    initializer=nn.initializer.Normal(
-                        mean=0.0, std=self.initializer_range),
+                    initializer=nn.initializer.Normal(mean=0.0, std=self.initializer_range),
                 ),
             )
+            set_weight_attrs(self.embeddings.weight, {"output_dim": False})
+            set_weight_attrs(self.embeddings.weight, {"weight_loader": self.weight_loader})
+        else:
+            # column cut embedding
+            self.embeddings = nn.Embedding(
+                num_embeddings,
+                embedding_dim // self.world_size,
+            )
+
+            self.embeddings.weight.is_distributed = True
+            self.embeddings.weight.split_axis = 1
+
+            set_weight_attrs(self.embeddings.weight, {"output_dim": True})
 
         self.prefix = prefix
-
-        if self.weight_sharing and self.weight_sharing_add_bias:
-            assert num_embeddings % self.world_size == 0
-            if self.use_ep:
-                self.bias = self.create_parameter(
-                    shape=[num_embeddings],
-                    dtype=paddle.get_default_dtype(),
-                    attr=paddle.ParamAttr(
-                        initializer=paddle.nn.initializer.Constant(value=0.0),
-                    ),
-                    is_bias=True,
-                )
-            else:
-                self.bias = self.create_parameter(
-                    shape=[num_embeddings // self.world_size],
-                    dtype=paddle.get_default_dtype(),
-                    attr=mask_lm_out_bias_attr,
-                    is_bias=True,
-                )
-                self.bias.is_distributed = True
-
-        if self.freeze_embedding:
-            self.word_embeddings.weight.learning_rate = 0.0
-            if not self.use_rope:
-                self.position_embeddings.weight.learning_rate = 0.0
-
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
-        self.rope_head_dim_shape_tensor = paddle.ones((self.rope_head_dim),
-                                                      dtype="int8")
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict: Dict[str, paddle.Tensor | np.ndarray]):
         """
         Load the checkpoint state dictionary into the layer.
 
         Args:
             state_dict (dict): A dictionary containing the checkpoint weights and biases.
         """
-        self.word_embeddings.weight.set_value(
-            get_tensor(state_dict.pop(self.prefix + ".weight")).astype(
-                paddle.get_default_dtype()))
+        if self.tie_word_embeddings and not self.general:
+            weight_tensor = get_tensor(state_dict[self.prefix + ".weight"]).astype(paddle.get_default_dtype())
+        else:
+            weight_tensor = get_tensor(state_dict.pop(self.prefix + ".weight")).astype(paddle.get_default_dtype())
 
-    def forward(self, ids_remove_padding=None):
+        self.embeddings.weight.set_value(weight_tensor)
+
+    @classmethod
+    def _get_indices(
+        cls,
+        vocab_size_paded: int,
+        org_vocab_size_padded: int,
+        vocab_size: int,
+        org_vocab_size: int,
+        tp_rank: int,
+        tp_size: int,
+    ) -> VocabParallelEmbeddingShardIndices:
+        """Get start and end indices for vocab parallel embedding, following the
+        layout outlined in the class docstring, based on the given tp_rank and
+        tp_size."""
+
+        num_added_embeddings_padded = vocab_size_paded - org_vocab_size_padded
+        padded_org_vocab_start_index, padded_org_vocab_end_index = vocab_range_from_global_vocab_size(
+            org_vocab_size_padded, tp_rank, tp_size
+        )
+
+        padded_added_vocab_start_index, padded_added_vocab_end_index = vocab_range_from_global_vocab_size(
+            num_added_embeddings_padded, tp_rank, tp_size, offset=org_vocab_size
+        )
+        # remove padding
+        org_vocab_start_index = min(padded_org_vocab_start_index, org_vocab_size)
+        org_vocab_end_index = min(padded_org_vocab_end_index, org_vocab_size)
+        added_vocab_start_index = min(padded_added_vocab_start_index, vocab_size)
+        added_vocab_end_index = min(padded_added_vocab_end_index, vocab_size)
+        return VocabParallelEmbeddingShardIndices(
+            padded_org_vocab_start_index,
+            padded_org_vocab_end_index,
+            padded_added_vocab_start_index,
+            padded_added_vocab_end_index,
+            org_vocab_start_index,
+            org_vocab_end_index,
+            added_vocab_start_index,
+            added_vocab_end_index,
+        )
+
+    def weight_loader(self, param, loaded_weight, shard_id=None):
+        output_dim = getattr(param, "output_dim", None)
+        packed_dim = getattr(param, "packed_dim", None)
+
+        if not param._is_initialized():
+            param.initialize()
+
+        loaded_weight = get_tensor(loaded_weight)
+        if param.dtype != loaded_weight.dtype:
+            if loaded_weight.dtype == paddle.int8 and param.dtype == paddle.float8_e4m3fn:
+                loaded_weight = loaded_weight.cast(param.dtype)
+            else:
+                loaded_weight = loaded_weight.cast(param.dtype)
+
+        if output_dim is None or self.fd_config.load_config.is_pre_sharded:
+            assert (
+                param.shape == loaded_weight.shape
+            ), f"Shape mismatch: param {param.shape} vs loaded_weight {loaded_weight.shape}"
+            param.copy_(loaded_weight, False)
+            return
+
+        start_idx = self.shard_indices.org_vocab_start_index
+        end_idx = self.shard_indices.org_vocab_end_index
+        shard_size = self.shard_indices.org_vocab_end_index - start_idx
+
+        # If param packed on the same dim we are sharding on, then
+        # need to adjust offsets of loaded weight by pack_factor.
+        if packed_dim is not None and packed_dim == output_dim:
+            packed_factor = getattr(param, "packed_factor", getattr(param, "pack_factor", 1))
+            assert loaded_weight.shape[output_dim] == (self.org_vocab_size // packed_factor)
+            start_idx = start_idx // packed_factor
+            shard_size = shard_size // packed_factor
+        else:
+            assert loaded_weight.shape[output_dim] == self.org_vocab_size, (
+                f"Loaded weight dim {output_dim} size {loaded_weight.shape[output_dim]} "
+                f"!= org_vocab_size {self.org_vocab_size}"
+            )
+
+        shard_weight = slice_fn(loaded_weight, output_dim, start_idx, end_idx)
+
+        if output_dim == 0:
+            h2d_copy(param[: shard_weight.shape[0]], shard_weight)
+            if not current_platform.is_maca():
+                if param.shape[0] != shard_weight.shape[0]:
+                    param[shard_weight.shape[0] :].fill_(0)
+        else:
+            h2d_copy(param[:, : shard_weight.shape[1]], shard_weight)
+            if param.shape[1] != shard_weight.shape[1]:
+                param[:, shard_weight.shape[1] :].fill_(0)
+
+    def forward(self, ids_remove_padding: paddle.Tensor = None, forward_meta: ForwardMeta = None) -> paddle.Tensor:
         """
         Defines the forward computation of the layer.
 
@@ -153,21 +303,35 @@ class VocabParallelEmbedding(nn.Layer):
         Returns:
             Tensor: Embedded tensor representation of the input IDs.
         """
-        if self.use_ep:
-            input_embedings = self.word_embeddings(ids_remove_padding)
+        if forward_meta is not None and forward_meta.is_zero_size:
+            return paddle.empty([0, self.embedding_dim], dtype=self.embeddings.weight.dtype)
+        if self.column_cut:
+            input_embedings = self.embeddings(ids_remove_padding)
+            inputs_embeds_temp = []
+            paddle.distributed.all_gather(
+                inputs_embeds_temp,
+                input_embedings,
+                group=self.tp_group,
+                sync_op=True,
+            )
+            input_embedings = paddle.concat(inputs_embeds_temp, -1)
         else:
-            if self.column_cut:
-                input_embedings = self.word_embeddings(ids_remove_padding)
-                inputs_embeds_temp = []
-                paddle.distributed.all_gather(
-                    inputs_embeds_temp,
-                    input_embedings,
-                    group=fleet.get_hybrid_communicate_group().
-                    get_model_parallel_group(),
-                    sync_op=True,
+            if envs.FD_DETERMINISTIC_MODE and self.world_size > 1:  # pragma: no cover
+                # Bypass Paddle's _mp_allreduce (NCCL) with Custom AR for determinism.
+                from paddle.distributed.fleet.layers.mpu import mp_ops
+
+                from fastdeploy.distributed.communication import (
+                    tensor_model_parallel_all_reduce,
                 )
-                input_embedings = paddle.concat(inputs_embeds_temp, -1)
+
+                output_parallel = mp_ops._c_lookup_table(
+                    self.embeddings.weight,
+                    ids_remove_padding,
+                    start_index=self.embeddings.vocab_start_index,
+                    vocab_size=self.embeddings.num_embeddings,
+                )
+                input_embedings = tensor_model_parallel_all_reduce(output_parallel, self.tp_group)
             else:
-                input_embedings = self.word_embeddings(ids_remove_padding)
+                input_embedings = self.embeddings(ids_remove_padding)
 
         return input_embedings

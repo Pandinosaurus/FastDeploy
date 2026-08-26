@@ -15,9 +15,15 @@
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, fields
-from typing import Any, Optional, Union, List
+
 import random
+from dataclasses import dataclass, fields
+from enum import Enum
+from typing import Any, List, Optional, TypeVar, Union
+
+from fastdeploy import envs
+
+T = TypeVar("T")
 
 
 @dataclass
@@ -51,6 +57,10 @@ class SamplingParams:
             the model more random. Zero means greedy sampling.
         top_p: Float that controls the cumulative probability of the top tokens
             to consider. Must be in [0, 1]. Set to 1 to consider all tokens.
+        top_k: Int that controls the number of top tokens to consider. Must be a positive integer.
+        min_p: Float that represents the minimum probability for a token to be
+            considered, relative to the probability of the most likely token.
+            Must be in [0, 1]. Set to 0 to disable this.
         seed: Random seed to use for the generation.
         stop: list of strings that stop the generation when they are generated.
             The returned output will not contain the stop strings.
@@ -62,6 +72,8 @@ class SamplingParams:
             token sequence is not allowed when the next generated token
             can complete the sequence.
         max_tokens: Maximum number of tokens to generate per output sequence.
+        reasoning_max_tokens: Maximum number of tokens to generate for reasoning per output sequence.
+        response_max_tokens: Maximum number of tokens to generate for response per output sequence.
         min_tokens: Minimum number of tokens to generate per output sequence
             before EOS or stop_token_ids can be generated
         logprobs: Number of log probabilities to return per output token.
@@ -75,38 +87,144 @@ class SamplingParams:
 
     n: int = 1
     best_of: Optional[int] = None
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
-    repetition_penalty: float = 1.0
-    temperature: float = 1.0
-    top_p: float = 0.7
+    presence_penalty: float = None
+    frequency_penalty: float = None
+    repetition_penalty: float = None
+    temperature: float = None
+    top_p: float = None
+    top_k: int = 0
+    min_p: float = 0.0
     seed: Optional[int] = None
-    stop: Optional[Union[str, List[str]]] = None 
-    stop_token_ids: Optional[Union[List[List[int]], List[int]]] = None
-    max_tokens: Optional[int] = 16
+    stop: Optional[Union[str, List[str]]] = None
+    stop_token_ids: Optional[List[int]] = None
+    stop_seqs_len: Optional[int] = None
+    max_tokens: Optional[int] = None
+    reasoning_max_tokens: Optional[int] = None
+    response_max_tokens: Optional[int] = None
     min_tokens: int = 1
     logprobs: Optional[int] = None
+    prompt_logprobs: Optional[int] = None
+    # For logits and logprobs post processing
+    temp_scaled_logprobs: bool = False
+    top_p_normalized_logprobs: bool = False
     bad_words: Optional[List[str]] = None
+    guided_decoding: Optional[GuidedDecodingParams] = None
+    bad_words_token_ids: Optional[List[int]] = None
+    logits_processors_args: Optional[dict[str, Any]] = None
 
     @classmethod
-    def from_dict(cls, req_dict: dict[str, Any]) -> "SamplingParams":
-        """Create a SamplingParams instance from a dictionary.
-        
-        Args:
-            req_dict: Dictionary containing sampling parameters where keys match 
-                     the field names of SamplingParams
-                     
-        Returns:
-            SamplingParams: A new instance initialized with values from the dictionary
-        """
-        return cls(**{
-            field.name: req_dict[field.name] if field.name in req_dict else field.default
-            for field in fields(cls)
-        })
-
+    def from_dict(cls, req_dict: dict[str, Any]) -> SamplingParams:
+        """Create instance from command line arguments"""
+        return cls(
+            **{
+                field.name: (req_dict[field.name] if field.name in req_dict else field.default)
+                for field in fields(cls)
+            }
+        )
 
     @classmethod
-    def from_optional(cls,
+    def from_generic_request(cls, req: T) -> SamplingParams:
+        logprobs_val = None
+        if hasattr(req, "top_logprobs"):
+            if getattr(req, "logprobs", None):
+                logprobs_val = getattr(req, "top_logprobs", None)
+        else:
+            logprobs_val = getattr(req, "logprobs", None)
+        max_tokens_val = (
+            req.max_completion_tokens or getattr(req, "max_tokens", cls.max_tokens)
+            if hasattr(req, "max_completion_tokens")
+            else getattr(req, "max_tokens", cls.max_tokens)
+        )
+
+        return cls(
+            n=getattr(req, "n", None) if getattr(req, "n", None) is not None else cls.n,
+            best_of=getattr(req, "best_of", None) if getattr(req, "best_of", None) is not None else cls.best_of,
+            presence_penalty=(
+                getattr(req, "presence_penalty", None)
+                if getattr(req, "presence_penalty", None) is not None
+                else cls.presence_penalty
+            ),
+            frequency_penalty=(
+                getattr(req, "frequency_penalty", None)
+                if getattr(req, "frequency_penalty", None) is not None
+                else cls.frequency_penalty
+            ),
+            repetition_penalty=(
+                getattr(req, "repetition_penalty", None)
+                if getattr(req, "repetition_penalty", None) is not None
+                else cls.repetition_penalty
+            ),
+            temperature=(
+                getattr(req, "temperature", None) if getattr(req, "temperature", None) is not None else cls.temperature
+            ),
+            top_p=getattr(req, "top_p", None) if getattr(req, "top_p", None) is not None else cls.top_p,
+            top_k=getattr(req, "top_k", None) if getattr(req, "top_k", None) is not None else cls.top_k,
+            min_p=getattr(req, "min_p", None) if getattr(req, "min_p", None) is not None else cls.min_p,
+            seed=getattr(req, "seed", None) if getattr(req, "seed", None) is not None else cls.seed,
+            stop=getattr(req, "stop", None) if getattr(req, "stop", None) is not None else cls.stop,
+            stop_token_ids=(
+                getattr(req, "stop_token_ids", None)
+                if getattr(req, "stop_token_ids", None) is not None
+                else cls.stop_token_ids
+            ),
+            stop_seqs_len=(
+                getattr(req, "stop_seqs_len", None)
+                if getattr(req, "stop_seqs_len", None) is not None
+                else cls.stop_seqs_len
+            ),
+            max_tokens=max_tokens_val,
+            reasoning_max_tokens=(
+                getattr(req, "reasoning_max_tokens", None)
+                if getattr(req, "reasoning_max_tokens", None) is not None
+                else cls.reasoning_max_tokens
+            ),
+            response_max_tokens=(
+                getattr(req, "response_max_tokens", None)
+                if getattr(req, "response_max_tokens", None) is not None
+                else cls.response_max_tokens
+            ),
+            min_tokens=(
+                getattr(req, "min_tokens", None) if getattr(req, "min_tokens", None) is not None else cls.min_tokens
+            ),
+            logprobs=logprobs_val,
+            prompt_logprobs=(
+                getattr(req, "prompt_logprobs", None)
+                if getattr(req, "prompt_logprobs", None) is not None
+                else cls.prompt_logprobs
+            ),
+            temp_scaled_logprobs=(
+                getattr(req, "temp_scaled_logprobs", None)
+                if getattr(req, "temp_scaled_logprobs", None) is not None
+                else cls.temp_scaled_logprobs
+            ),
+            top_p_normalized_logprobs=(
+                getattr(req, "top_p_normalized_logprobs", None)
+                if getattr(req, "top_p_normalized_logprobs", None) is not None
+                else cls.top_p_normalized_logprobs
+            ),
+            bad_words=(
+                getattr(req, "bad_words", None) if getattr(req, "bad_words", None) is not None else cls.bad_words
+            ),
+            guided_decoding=(
+                getattr(req, "guided_decoding", None)
+                if getattr(req, "guided_decoding", None) is not None
+                else cls.guided_decoding
+            ),
+            bad_words_token_ids=(
+                getattr(req, "bad_words_token_ids", None)
+                if getattr(req, "bad_words_token_ids", None) is not None
+                else cls.bad_words_token_ids
+            ),
+            logits_processors_args=(
+                getattr(req, "logits_processors_args", None)
+                if getattr(req, "logits_processors_args", None) is not None
+                else cls.logits_processors_args
+            ),
+        )
+
+    @classmethod
+    def from_optional(
+        cls,
         n,
         best_of,
         presence_penalty,
@@ -114,137 +232,191 @@ class SamplingParams:
         repetition_penalty,
         temperature,
         top_p,
+        top_k,
+        min_p,
         seed=None,
         stop=None,
         stop_token_ids=None,
         max_tokens=None,
+        reasoning_max_tokens=None,
+        response_max_tokens=None,
         min_tokens=1,
         logprobs=None,
-        bad_words=None
-        ) -> "SamplingParams":
-        """Create a SamplingParams instance from optional arguments with default fallbacks.
-        
-        Args:
-            n: Number of output sequences (default: 1)
-            best_of: Number of sequences to generate before selecting best (default: None)
-            presence_penalty: Penalty for new tokens (default: 0.0)
-            frequency_penalty: Penalty based on token frequency (default: 0.0)
-            repetition_penalty: Penalty for repeated tokens (default: 1.0)
-            temperature: Sampling temperature (default: 1.0)
-            top_p: Nucleus sampling probability (default: 0.7)
-            seed: Random seed (default: random)
-            stop: Stop sequences (default: None)
-            stop_token_ids: Stop token IDs (default: None)
-            max_tokens: Maximum tokens to generate (default: 8192)
-            min_tokens: Minimum tokens before stopping (default: 1)
-            logprobs: Number of logprobs to return (default: None)
-            bad_words: List of banned words (default: None)
-            
-        Returns:
-            SamplingParams: A new instance with provided or default values
-        """
+        prompt_logprobs=None,
+        bad_words=None,
+        guided_decoding=None,
+        bad_words_token_ids=None,
+        logits_processors_args=None,
+    ) -> SamplingParams:
+        """Create instance from command line arguments"""
         return cls(
             n=1 if n is None else n,
             best_of=best_of,
-            presence_penalty=presence_penalty if presence_penalty is not None else 0.0,
-            frequency_penalty=frequency_penalty if frequency_penalty is not None else 0.0,
-            repetition_penalty=repetition_penalty if repetition_penalty is not None else 1.0,
+            presence_penalty=(presence_penalty if presence_penalty is not None else 0.0),
+            frequency_penalty=(frequency_penalty if frequency_penalty is not None else 0.0),
+            repetition_penalty=(repetition_penalty if repetition_penalty is not None else 1.0),
             temperature=temperature if temperature is not None else 1.0,
-            top_p=top_p if top_p is not None else 0.7,
+            top_p=top_p,
+            top_k=top_k if top_k is not None else 0,
+            min_p=min_p if min_p is not None else 0.0,
             seed=seed,
             stop=stop,
             stop_token_ids=stop_token_ids,
             max_tokens=max_tokens if max_tokens is not None else 8192,
+            reasoning_max_tokens=reasoning_max_tokens,
+            response_max_tokens=response_max_tokens,
             min_tokens=min_tokens,
             logprobs=logprobs,
-            bad_words=bad_words
+            prompt_logprobs=prompt_logprobs,
+            bad_words=bad_words,
+            guided_decoding=guided_decoding,
+            bad_words_token_ids=bad_words_token_ids,
+            logits_processors_args=logits_processors_args,
         )
 
-
     def __post_init__(self):
-        """Initialize sampling parameters after instance creation.
-        
-        Sets a random seed if none provided and validates all parameters.
-        """
         if self.seed is None:
-            self.seed = random.randint(0, 922337203685477580)
+            # Deterministic mode: use fixed seed
+            if envs.FD_DETERMINISTIC_MODE:
+                self.seed = 42
+            else:
+                self.seed = random.randint(0, 922337203685477580)
         self._verify_args()
 
-
     def _verify_args(self) -> None:
-        """Validate all sampling parameters.
-        
-        Raises:
-            ValueError: If any parameter is outside its valid range or of incorrect type
-        """
         if not isinstance(self.n, int):
             raise ValueError(f"n must be an int, but is of type {type(self.n)}")
         if self.n < 1:
             raise ValueError(f"n must be at least 1, got {self.n}.")
-        if not -2.0 <= self.presence_penalty <= 2.0:
-            raise ValueError("presence_penalty must be in [-2, 2], got "
-                             f"{self.presence_penalty}.")
-        if not -2.0 <= self.frequency_penalty <= 2.0:
-            raise ValueError("frequency_penalty must be in [-2, 2], got "
-                             f"{self.frequency_penalty}.")
-        if self.repetition_penalty <= 0.0:
-            raise ValueError(
-                "repetition_penalty must be greater than zero, got "
-                f"{self.repetition_penalty}.")
-        if self.temperature < 0.0:
-            raise ValueError(
-                f"temperature must be non-negative, got {self.temperature}.")
-        if not 0.0 <= self.top_p <= 1.0:
+        if self.presence_penalty is not None and (not -2.0 <= self.presence_penalty <= 2.0):
+            raise ValueError("presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}.")
+        if self.frequency_penalty is not None and (not -2.0 <= self.frequency_penalty <= 2.0):
+            raise ValueError("frequency_penalty must be in [-2, 2], got " f"{self.frequency_penalty}.")
+        if self.repetition_penalty is not None and self.repetition_penalty <= 0.0:
+            raise ValueError("repetition_penalty must be greater than zero, got " f"{self.repetition_penalty}.")
+        if self.temperature is not None and self.temperature < 0.0:
+            raise ValueError(f"temperature must be non-negative, got {self.temperature}.")
+        if self.top_p is not None and not 0.0 <= self.top_p <= 1.0:
             raise ValueError(f"top_p must be in [0, 1], got {self.top_p}.")
+        # quietly accept -1 as disabled, but prefer 0
+        if self.top_k < -1:
+            raise ValueError(f"top_k must be 0 (disable), or at least 1, " f"got {self.top_k}.")
+        if not isinstance(self.top_k, int):
+            raise TypeError(f"top_k must be an integer, got {type(self.top_k).__name__}")
+        if not 0.0 <= self.min_p <= 1.0:
+            raise ValueError("min_p must be in [0,1],got f{self.min_p}")
 
         if self.max_tokens is not None and self.max_tokens < 1:
-            raise ValueError(
-                f"max_tokens must be at least 1, got {self.max_tokens}.")
+            raise ValueError(f"max_tokens must be at least 1, got {self.max_tokens}.")
+
+        if self.reasoning_max_tokens is not None and self.reasoning_max_tokens > self.max_tokens:
+            self.reasoning_max_tokens = self.max_tokens
+        # response_max_tokens TODO
+
         if self.min_tokens < 0:
-            raise ValueError(f"min_tokens must be greater than or equal to 0, "
-                             f"got {self.min_tokens}.")
+            raise ValueError(f"min_tokens must be greater than or equal to 0, " f"got {self.min_tokens}.")
         if self.max_tokens is not None and self.min_tokens > self.max_tokens:
             raise ValueError(
-                f"min_tokens must be less than or equal to "
-                f"max_tokens={self.max_tokens}, got {self.min_tokens}.")
-        if self.logprobs is not None and self.logprobs < 0:
-            raise ValueError(
-                f"logprobs must be non-negative, got {self.logprobs}.")
+                f"min_tokens must be less than or equal to " f"max_tokens={self.max_tokens}, got {self.min_tokens}."
+            )
+
+        if not envs.FD_USE_GET_SAVE_OUTPUT_V1:  # False (0)
+            if self.logprobs is not None and (self.logprobs < 0 or self.logprobs > 20):
+                raise ValueError("Invalid value for 'top_logprobs': must be between 0 and 20.")
+            if self.prompt_logprobs is not None:
+                raise ValueError("prompt_logprobs is not support when FD_USE_GET_SAVE_OUTPUT_V1 is disabled.")
+        else:  # True (1)
+            if self.logprobs is not None and self.logprobs < -1:
+                raise ValueError(f"logprobs must be a non-negative value or -1, got {self.logprobs}.")
+            if self.prompt_logprobs is not None and self.prompt_logprobs < -1:
+                raise ValueError(f"prompt_logprobs a must be non-negative value or -1, got {self.prompt_logprobs}.")
 
         if not 0 <= self.seed <= 922337203685477580:
-            raise ValueError("seed must be in [0, 922337203685477580], got "
-                             f"{self.seed}.")
+            raise ValueError("seed must be in [0, 922337203685477580], got " f"{self.seed}.")
 
-
-    def update_from_tokenizer(self, tokenizer):
-        """Update sampling parameters based on tokenizer configuration.
-        
-        Note: Currently a placeholder for future implementation of:
-        - Stop tokens handling
-        - Bad words filtering
-        
-        Args:
-            tokenizer: The tokenizer instance to use for configuration
-        """
-        # TODO: Implement stop tokens and bad words support
-        pass
+        # Verify logits processors arguments
+        if self.logits_processors_args is not None:
+            if self.logits_processors_args.get("logit_bias") is not None:
+                logit_bias = self.logits_processors_args.get("logit_bias")
+                if not isinstance(logit_bias, dict):
+                    raise TypeError(f"logit_bias must be a dict, but got {type(logit_bias)}")
+                elif not all(isinstance(k, int) and isinstance(v, float) for k, v in logit_bias.items()):
+                    # try to cast the dict to the correct type first
+                    try:
+                        cast_logit_bias = {}
+                        for k, v in logit_bias.items():
+                            cast_logit_bias[int(k)] = float(v)
+                        self.logits_processors_args["logit_bias"] = cast_logit_bias
+                    except:
+                        raise TypeError(
+                            "failed to cast logit_bias to the correct {key -> value} type, expected {int -> float}"
+                        )
 
 
 @dataclass
 class BeamSearchParams:
-    """Parameters for beam search text generation.
-    
-    Args:
-        beam_width: Number of beams to maintain during search
-        max_tokens: Maximum number of tokens to generate
-        ignore_eos: Whether to ignore EOS tokens (default: False)
-        temperature: Sampling temperature (0 means greedy, default: 0.0)
-        length_penalty: Penalty applied to length (1.0 means no penalty, default: 1.0)
-        include_stop_str_in_output: Whether to include stop strings in output (default: False)
-    """
+    """Beam search parameters for text generation."""
+
     beam_width: int
     max_tokens: int
     ignore_eos: bool = False
     temperature: float = 0.0
     length_penalty: float = 1.0
     include_stop_str_in_output: bool = False
+
+
+@dataclass
+class GuidedDecodingParams:
+    """Guided decoding parameters for text generation."""
+
+    json: Optional[Union[str, dict]] = None
+    regex: Optional[str] = None
+    choice: Optional[List[str]] = None
+    grammar: Optional[str] = None
+    json_object: Optional[bool] = None
+    structural_tag: Optional[str] = None
+
+    def to_dict(self):
+        """convert to dict"""
+        key_dict = {
+            "guided_json": self.json,
+            "guided_regex": self.regex,
+            "guided_choice": self.choice,
+            "guided_grammar": self.grammar,
+            "structural_tag": self.structural_tag,
+            "guided_json_object": self.json_object,
+        }
+
+        guided_dict = {}
+        for key, value in key_dict.items():
+            if value is not None:
+                guided_dict[key] = value
+        return guided_dict
+
+    def __post_init__(self):
+        """Verify the arguments."""
+        guided_count = sum(
+            [
+                self.json is not None,
+                self.regex is not None,
+                self.choice is not None,
+                self.grammar is not None,
+                self.json_object is not None,
+                self.structural_tag is not None,
+            ]
+        )
+
+        if guided_count > 1:
+            raise ValueError(
+                "You can only use one kind of guided decoding "
+                "('json', 'json_object', 'regex', 'choice', 'grammar', 'structural_tag')."
+            )
+
+
+class RequestOutputKind(Enum):
+    # Return entire output so far in every RequestOutput
+    CUMULATIVE = 0
+    # Return only deltas in each RequestOutput
+    DELTA = 1
+    # Do not return intermediate RequestOutput
+    FINAL_ONLY = 2

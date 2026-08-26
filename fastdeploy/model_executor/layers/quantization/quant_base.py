@@ -13,8 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
+
 from abc import ABC, abstractmethod
 from typing import Any, Optional
+
+# NVFP4 requires SM >= 100 (Blackwell architecture)
+NVFP4_MIN_SM_VERSION = 100
+
+from fastdeploy.platforms import current_platform
+
+
+def is_nvfp4_supported() -> bool:
+    if current_platform.is_cuda():
+        """Check if current GPU supports NVFP4 (requires SM >= 100, Blackwell)."""
+        from fastdeploy.model_executor.utils import get_sm_version
+
+        sm_version = get_sm_version()
+        return sm_version >= NVFP4_MIN_SM_VERSION
+    else:
+        return False
 
 
 class QuantMethodBase(ABC):
@@ -47,12 +64,9 @@ class QuantConfigBase(ABC):
 
     def __init__(self):
         super().__init__()
-        self.quant_round_type = None
-        self.quant_max_bound = None
-        self.quant_min_bound = None
 
     @abstractmethod
-    def get_name(self) -> str:
+    def name(self) -> str:
         """Name of the quantization method."""
         raise NotImplementedError
 
@@ -68,8 +82,7 @@ class QuantConfigBase(ABC):
         for key in keys:
             if key in config:
                 return config[key]
-        raise ValueError(f"Cannot find any of {keys} in the model's "
-                         "quantization config.")
+        raise ValueError(f"Cannot find any of {keys} in the model's " "quantization config.")
 
     @abstractmethod
     def get_quant_method(self, layer, prefix) -> Optional[QuantMethodBase]:

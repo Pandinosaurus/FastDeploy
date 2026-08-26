@@ -1,0 +1,31 @@
+server:
+  port: "8080"
+  host: "0.0.0.0"
+  mode: "debug" # debug, release, test
+  splitwise: true # true means pd mode, false means mixed mode
+
+scheduler:
+  policy: "power_of_two"
+  prefill-policy: "cache_aware"
+  decode-policy: "request_num"
+  eviction-interval-secs: 60
+  eviction-duration-mins: 30 # eviction duration for cache-aware radix tree nodes (minutes); default: 30
+  balance-abs-threshold: 1
+  balance-rel-threshold: 0.2
+  hit-ratio-weight: 1.0
+  load-balance-weight: 0.05
+  cache-block-size: 4
+  waiting-weight: 10
+  stats-interval-secs: 5 # interval in seconds for periodic stats logging (running requests, cache hit rate)
+
+manager:
+  health-failure-threshold: 3
+  health-success-threshold: 2
+  health-check-timeout-secs: 5
+  health-check-interval-secs: 5
+  health-check-endpoint: /health
+  register-path: "config/register.yaml"
+
+log:
+  level: "info"  # debug, info, warn, error
+  output: "file" # stdout, file

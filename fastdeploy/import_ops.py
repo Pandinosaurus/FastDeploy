@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """import ops"""
+import functools
 import importlib
 import inspect
-import os
+
+import paddle
 
 from fastdeploy.utils import llm_logger as logger
 
@@ -40,9 +42,8 @@ def import_custom_ops(package, module_name, global_ns):
             except Exception as e:
                 logger.warning(f"Failed to import op {func_name}: {e}")
 
-    except Exception:
-        logger.warning(
-            f"Ops of {package} import failed, it may be not compiled.")
+    except Exception as e:
+        logger.warning(f"Ops of {package} import failed, it may be not compiled. {e}")
 
     preprocess_static_op(global_ns)
 
@@ -62,6 +63,34 @@ def rename_imported_op(old_name, new_name, global_ns):
     del global_ns[old_name]
 
 
+def wrap_unified_op(original_cpp_ext_op, original_custom_op):
+    """
+    Wrap a static operator into a unified operator with runtime dispatching.
+    Args:
+        original_cpp_ext_op: Original C++ extension operator function.
+        original_custom_op: Original custom operator function.
+    """
+    try:
+
+        @paddle.jit.marker.unified
+        @functools.wraps(original_custom_op)
+        def unified_op(*args, **kwargs):
+            if paddle.in_dynamic_mode():
+                res = original_cpp_ext_op(*args, **kwargs)
+                if res is None:
+                    return None
+                # TODO(DrRyanHuang): Remove this if when we align the implementation of custom op and C++ extension
+                if isinstance(res, list) and len(res) == 1:
+                    return res[0]
+                return res
+            return original_custom_op(*args, **kwargs)
+
+    except:
+        unified_op = None
+        logger.warning("Paddle version not support JIT mode.")
+    return unified_op
+
+
 def preprocess_static_op(global_ns):
     """
     Transforms operator/function references in the global namespace based on the presence of 'static_op_' prefixes.
@@ -73,15 +102,12 @@ def preprocess_static_op(global_ns):
     static_op_prefix = "static_op_"
     static_op_names = [k for k in global_ns if k.startswith(static_op_prefix)]
 
-    dynamic_mode = int(os.getenv("ELLM_DYNAMIC_MODE", "1")) == 1
+    for static_op_name in static_op_names:
+        op_name = static_op_name.removeprefix(static_op_prefix)
+        if op_name not in global_ns:
+            global_ns[op_name] = global_ns[static_op_name]
+            continue
 
-    for static_op in static_op_names:
-        op_name = static_op[len(static_op_prefix):]
-        has_dynamic_op = op_name in global_ns
-
-        if has_dynamic_op:
-            if not dynamic_mode:
-                del global_ns[op_name]
-                global_ns[op_name] = global_ns[static_op]
-        else:
-            global_ns[op_name] = global_ns[static_op]
+        original_cpp_ext_op = global_ns[op_name]
+        original_custom_op = global_ns[static_op_name]
+        global_ns[op_name] = wrap_unified_op(original_cpp_ext_op, original_custom_op)

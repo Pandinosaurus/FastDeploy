@@ -14,53 +14,21 @@
 # limitations under the License.
 """
 
+from typing import Dict, Optional
+
+import numpy as np
 import paddle
 from paddle import nn
 from paddle.distributed import fleet
 
+from fastdeploy.config import FDConfig
+from fastdeploy.model_executor.layers.utils import (
+    DEFAULT_VOCAB_PADDING_SIZE,
+    pad_vocab_size,
+)
+from fastdeploy.model_executor.utils import set_weight_attrs, temporary_dtype
+
 from .utils import get_tensor
-
-
-def parallel_matmul(lm_output, logit_weights, parallel_output):
-    """
-    Performs parallel matrix multiplication for large-scale language models.
-
-    Args:
-        lm_output (Tensor): The output tensor from the language model layers,
-            which will be multiplied with the logit weights.
-        logit_weights (Tensor): The weights used in the matrix multiplication,
-            typically the weights of the output layer.
-        parallel_output (bool): A flag indicating whether to return the parallel
-            outputs or concatenate them. If True, returns the outputs from the
-            parallel computation directly. If False, concatenates the outputs
-            across the model parallel group before returning.
-
-    Returns:
-        Tensor: The result of the matrix multiplication. If `parallel_output` is True,
-            returns the parallel outputs. If `parallel_output` is False and
-            model parallel world size is greater than 1, returns the concatenated
-            outputs across the model parallel group. Otherwise, returns the direct
-            matrix multiplication result.
-    """
-    hcg = fleet.get_hybrid_communicate_group()
-    model_parallel_group = hcg.get_model_parallel_group()
-    world_size = hcg.get_model_parallel_world_size()
-    # rank = hcg.get_model_parallel_rank()
-
-    if world_size > 1:
-        input_parallel = paddle.distributed.collective._c_identity(
-            lm_output, group=model_parallel_group)
-
-        logits = paddle.matmul(input_parallel, logit_weights, transpose_y=True)
-
-        if parallel_output:
-            return logits
-
-        return paddle.distributed.collective._c_concat(
-            logits, group=model_parallel_group)
-    else:
-        logits = paddle.matmul(lm_output, logit_weights, transpose_y=True)
-        return logits
 
 
 class ParallelLMHead(nn.Layer):
@@ -70,77 +38,93 @@ class ParallelLMHead(nn.Layer):
 
     def __init__(
         self,
-        llm_config,
-        num_embeddings,
-        embedding_dim,
-        prefix="",
-        with_bias=False,
-        tie_word_embeddings=None,
-    ):
+        fd_config: FDConfig,
+        num_embeddings: int,
+        embedding_dim: int,
+        prefix: str = "",
+        with_bias: bool = False,
+        dtype: str = None,
+        padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
+    ) -> None:
         """
         Parallelized LMhead.
 
         Args:
-            llm_config (LLMConfig): Arguments related to inference, containing
+            fd_config (FDConfig): Arguments related to inference, containing
                 attributes such as weight_dtype, act_dtype, mp_size, hidden_size, head_dim,
                 num_attention_heads, and ffn_hidden_size.
             num_embeddings (int): vocabulary size.
             embedding_dim (int): size of hidden state.
-            tie_embeddings_weight (bool, optional): Whether to share weights across model parallel ranks,
-                defaults to None.
-            prefix (str): full name of the layer in the state dict
+            prefix (str): The name of current layer. Defaults to "".
+            with_bias (bool): whether to have bias. Default: False.
+            dtype (str): The dtype of weight. Default: None.
         """
         super(ParallelLMHead, self).__init__()
-        self.use_moe = llm_config.model_config.use_moe
-        self.linear_weight_key = prefix + ".weight"
+        self.weight_key: str = prefix + ".weight"
         if with_bias:
-            self.linear_bias_key = prefix + ".bias"
+            self.bias_key: Optional[str] = prefix + ".bias"
         else:
-            self.linear_bias_key = None
-        self.use_ep = llm_config.parallel_config.use_ep
+            self.bias_key: Optional[str] = None
+        self.embedding_dim = embedding_dim
+        self.tp_group = fd_config.parallel_config.tp_group
         self.column_cut = True
-        self.fused_linear = True
+        self.tp_size = fd_config.parallel_config.tensor_parallel_size
+        self.fd_config = fd_config
+        self.padding_size = padding_size
 
-        hcg = fleet.get_hybrid_communicate_group()
-        mp_rank = hcg.get_model_parallel_rank()
+        if num_embeddings % self.tp_size != 0:
+            num_embeddings = pad_vocab_size(num_embeddings, self.padding_size)
+        self.num_embeddings = num_embeddings
+
         ColumnParallelLinear = fleet.meta_parallel.ColumnParallelLinear
         RowParallelLinear = fleet.meta_parallel.RowParallelLinear
+        self.dtype = "float32" if fd_config.model_config.lm_head_fp32 else dtype
 
-        self.tie_word_embeddings = tie_word_embeddings
+        self.tie_word_embeddings: bool = fd_config.model_config.tie_word_embeddings
+        self.need_gather = True
 
-        if self.tie_word_embeddings is None:
-            if self.use_ep:
-                self.weight = self.create_parameter(
-                    shape=[embedding_dim, num_embeddings],
-                    dtype=paddle.get_default_dtype(),
-                    is_bias=False,
+        with temporary_dtype(self.dtype):
+            if self.column_cut:
+                need_gather = True
+                self.linear = ColumnParallelLinear(
+                    embedding_dim,
+                    num_embeddings,
+                    mp_group=self.tp_group,
+                    weight_attr=None,
+                    has_bias=True if self.bias_key is not None else False,
+                    gather_output=need_gather,
+                    fuse_matmul_bias=False,
                 )
-            else:
-                if self.column_cut:
-                    need_gather = True
-                    self.out_linear = ColumnParallelLinear(
-                        embedding_dim,
-                        num_embeddings,
-                        mp_group=fleet.get_hybrid_communicate_group().
-                        get_model_parallel_group(),
-                        weight_attr=None,
-                        has_bias=True,
-                        gather_output=need_gather,
-                        fuse_matmul_bias=self.fused_linear,  # False diff更小
-                    )
-                else:
-                    self.out_linear = RowParallelLinear(
-                        embedding_dim,
-                        num_embeddings,
-                        mp_group=fleet.get_hybrid_communicate_group().
-                        get_model_parallel_group(),
-                        weight_attr=None,
-                        has_bias=True,
-                        input_is_parallel=False,
-                        fuse_matmul_bias=self.fused_linear,  # False diff更小
-                    )
+                set_weight_attrs(
+                    self.linear.weight,
+                    {
+                        "weight_need_transpose": self.fd_config.model_config.model_format == "torch",
+                    },
+                )
+                set_weight_attrs(self.linear.weight, {"output_dim": True})
+                if self.tp_size > 1:
+                    if with_bias:
+                        set_weight_attrs(self.linear.bias, {"output_dim": True})
 
-    def load_state_dict(self, state_dict):
+            else:
+                self.linear = RowParallelLinear(
+                    embedding_dim,
+                    num_embeddings,
+                    mp_group=self.tp_group,
+                    weight_attr=None,
+                    has_bias=True if self.bias_key is not None else False,
+                    input_is_parallel=False,
+                    fuse_matmul_bias=False,
+                )
+                set_weight_attrs(
+                    self.linear.weight,
+                    {
+                        "weight_need_transpose": self.fd_config.model_config.model_format == "torch",
+                    },
+                )
+                set_weight_attrs(self.linear.weight, {"output_dim": False})
+
+    def load_state_dict(self, state_dict: Dict[str, paddle.Tensor | np.ndarray]):
         """
         Load the checkpoint state dictionary into the layer.
 
@@ -148,28 +132,21 @@ class ParallelLMHead(nn.Layer):
             state_dict (dict): A dictionary containing the checkpoint weights and biases.
         """
 
-        if self.tie_word_embeddings is None:
-            if self.use_ep:
-                self.weight.set_value(
-                    get_tensor(state_dict.pop(self.linear_weight_key)).astype(
-                        paddle.get_default_dtype()))
-            else:
-                self.out_linear.weight.set_value(
-                    get_tensor(state_dict.pop(self.linear_weight_key)).astype(
-                        paddle.get_default_dtype()))
+        if self.tie_word_embeddings:
+            self.linear.weight.set_value(
+                get_tensor(state_dict.pop(self.weight_key)).astype(self.linear.weight.dtype).transpose([1, 0])
+            )
+        else:
+            weight_tensor = get_tensor(state_dict.pop(self.weight_key)).astype(self.linear.weight.dtype)
+            if self.linear.weight.shape != weight_tensor.shape:
+                weight_tensor = weight_tensor.transpose([1, 0])
+            self.linear.weight.set_value(weight_tensor)
 
-                bias = (
-                    get_tensor(state_dict.pop(self.linear_bias_key)).astype(
-                        paddle.get_default_dtype()
-                    )
-                    if self.linear_bias_key is not None
-                    else paddle.zeros(
-                        self.out_linear.bias.shape, dtype=paddle.get_default_dtype()
-                    )
-                )
-                self.out_linear.bias.set_value(bias)
+        if self.bias_key is not None:
+            bias = get_tensor(state_dict.pop(self.bias_key)).astype(self.linear.bias.dtype)
+            self.linear.bias.set_value(bias)
 
-    def forward(self, input):
+    def forward(self, input: paddle.Tensor) -> paddle.Tensor:
         """
         Defines the forward computation of the layer.
 
@@ -179,12 +156,6 @@ class ParallelLMHead(nn.Layer):
         Returns:
             Tensor: The output tensor after processing through the layer.
         """
-        logits = input
-        if self.tie_word_embeddings is not None:
-            logits = parallel_matmul(logits, self.tie_word_embeddings, False)
-        else:
-            if self.use_ep:
-                logits = paddle.matmul(logits, self.weight)
-            else:
-                logits = self.out_linear(logits)
+        logits = input.astype(self.linear.weight.dtype)
+        logits = self.linear(logits)
         return logits

@@ -14,19 +14,20 @@
 # limitations under the License.
 """
 
-"""
-cuda platform file
-"""
+import traceback
 
 import paddle
+
+from fastdeploy.utils import console_logger as logger
+
 from .base import Platform, _Backend
-from paddlenlp.utils.log import logger
 
 
 class CUDAPlatform(Platform):
     """
     cuda platform class
     """
+
     device_name = "gpu"
 
     @classmethod
@@ -41,25 +42,42 @@ class CUDAPlatform(Platform):
             logger.warning(
                 "You are using GPU version PaddlePaddle, but there is no GPU "
                 "detected on your machine. Maybe CUDA devices is not set properly."
-                f"\n Original Error is {e}"
+                f"\n Original Error is {e}, "
+                f"{str(traceback.format_exc())}"
             )
             return False
 
     @classmethod
-    def get_attention_backend_cls(
-        cls,
-        selected_backend
-    ):
+    def get_attention_backend_cls(cls, selected_backend: _Backend):
         """
         get_attention_backend_cls
         """
         if selected_backend == _Backend.NATIVE_ATTN:
             logger.info("Using NATIVE ATTN backend.")
-            return ("fastdeploy.model_executor.layers.attention.PaddleNativeAttnBackend")
+            return "fastdeploy.model_executor.layers.attention.PaddleNativeAttnBackend"
         elif selected_backend == _Backend.APPEND_ATTN:
             logger.info("Using APPEND ATTN backend.")
-            return ("fastdeploy.model_executor.layers.attention.AppendAttentionBackend")
+            return "fastdeploy.model_executor.layers.attention.AppendAttentionBackend"
+        elif selected_backend == _Backend.MLA_ATTN:
+            logger.info("Using MLA ATTN backend.")
+            return "fastdeploy.model_executor.layers.attention.MLAAttentionBackend"
+        elif selected_backend == _Backend.DSA_ATTN:
+            logger.info("Using DSA ATTN backend.")
+            return "fastdeploy.model_executor.layers.attention.DSAAttentionBackend"
+        elif selected_backend == _Backend.FLASH_ATTN:
+            logger.info("Using FLASH ATTN backend.")
+            return "fastdeploy.model_executor.layers.attention.FlashAttentionBackend"
+        elif selected_backend == _Backend.PLAS_ATTN:
+            logger.info("Using PLAS ATTN backend.")
+            return "fastdeploy.model_executor.layers.attention.PlasAttentionBackend"
+        elif selected_backend == _Backend.FLASH_MASK_ATTN:
+            logger.info("Using FLASH MASK ATTN backend.")
+            return "fastdeploy.model_executor.layers.attention.FlashMaskAttentionBackend"
+        elif selected_backend == _Backend.DECODE_UNIFIED_ATTN:
+            logger.info("Using DECODE UNIFIED ATTN backend.")
+            return "fastdeploy.model_executor.layers.attention.DecodeUnifiedAttentionBackend"
         else:
-            logger.warning(
-                "Other backends are not supported for now."
+            raise ValueError(
+                "Invalid attention backend you specified.\n"
+                "Now only support [NATIVE_ATTN, MLA_ATTN, APPEND_ATTN, DECODE_UNIFIED_ATTN, FLASH_ATTN] in cuda place."
             )

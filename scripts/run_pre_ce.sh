@@ -1,0 +1,88 @@
+#!/bin/bash
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "$DIR"
+
+# python -m pip install --pre paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/nightly/cu126/
+python -m pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+python -m pip install -r requirements.txt
+python -m pip install jsonschema aistudio_sdk==0.3.5
+# Use prebuilt wheel files to install xgrammar==0.1.19 triton==3.4.0 nvidia_nccl_cu12==2.27.3 and torch==2.8.0 specifically for the CI environment
+python -m pip install --no-deps \
+    https://paddle-qa.bj.bcebos.com/FastDeploy/torch-2.8.0-cp310-cp310-manylinux_2_28_x86_64.whl \
+    https://paddle-qa.bj.bcebos.com/FastDeploy/nvidia_nccl_cu12-2.27.3-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl \
+    https://paddle-qa.bj.bcebos.com/FastDeploy/triton-3.4.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl \
+    https://paddle-qa.bj.bcebos.com/FastDeploy/xgrammar-0.1.19-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+
+# install runtime dependencies for torch and xgrammar
+python -m pip install pydantic sentencepiece tiktoken ninja filelock sympy jinja2 fsspec
+
+failed_files=()
+run_path="$DIR/../tests/ci_use/"
+
+# load all test files
+for subdir in "$run_path"*/; do
+    if [ -d "$subdir" ]; then
+        pushd "$subdir" > /dev/null || continue  # into test dir or continue
+
+        # search for test_*.py files
+        for file in test_*.py; do
+            if [ -f "$file" ]; then
+                echo "============================================================"
+                echo "Running pytest on $(realpath "$file")"
+                echo "------------------------------------------------------------"
+
+                set +e
+                timeout 600 python -m pytest --disable-warnings -sv "$file"
+                exit_code=$?
+                set -e
+                ps -ef | grep "${FD_CACHE_QUEUE_PORT}" | grep -v grep | awk '{print $2}' | xargs -r kill -9
+                ps -ef | grep "${FD_ENGINE_QUEUE_PORT}" | grep -v grep | awk '{print $2}' | xargs -r kill -9
+
+                if [ $exit_code -ne 0 ]; then
+                    if [ -d "${subdir%/}/log" ]; then
+                        echo ">>> grep error in ${subdir%/}/log/"
+                        grep -Rni --color=auto "error" "${subdir%/}/log/" --exclude="pytest_*_error.log" --exclude="backup_env.*.json" --exclude="default.*.log" --exclude="envlog.*" --exclude="cache_messager*" --exclude="*.log.[0-9]*" | awk -F: '{key=$1; for(i=3;i<=NF;i++) key=key":"$i; gsub(/[0-9]+-[0-9]+-[0-9]+ [0-9]+:[0-9]+:[0-9]+,[0-9]+ [0-9]+/, "", key); if (!seen[key]++) print}' || true
+                    else
+                        echo "${subdir%/}/log directory not found"
+                    fi
+
+                    if [ -f "${subdir%/}/log/paddle/workerlog.0" ]; then
+                        echo "---------------- log/paddle/workerlog.0 -------------------"
+                        cat "${subdir%/}/log/paddle/workerlog.0"
+                        echo "----------------------------------------------------"
+                    fi
+
+                    if [ -f "${subdir%/}/server.log" ]; then
+                        echo "---------------- server.log ----------------"
+                        cat "${subdir%/}/server.log"
+                        echo "--------------------------------------------"
+                    fi
+
+                    if [ "$exit_code" -eq 1 ] || [ "$exit_code" -eq 124 ]; then
+                        echo "[ERROR] $file 起服务或执行异常，exit_code=$exit_code"
+                        if [ "$exit_code" -eq 124 ]; then
+                            echo "[TIMEOUT] $file 脚本执行超过 10 分钟, 任务超时退出！"
+                        fi
+                    fi
+
+                    failed_files+=("$subdir$file")
+                    exit 1
+                fi
+                echo "------------------------------------------------------------"
+            fi
+        done
+        popd > /dev/null  # back to test dir
+    fi
+done
+
+if [ ${#failed_files[@]} -gt 0 ]; then
+    echo "The following tests failed:"
+    for f in "${failed_files[@]}"; do
+        echo "$f"
+    done
+    exit 1
+else
+    echo "All tests passed!"
+    exit 0
+fi

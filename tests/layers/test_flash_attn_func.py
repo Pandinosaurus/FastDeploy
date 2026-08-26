@@ -1,0 +1,390 @@
+# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import sys
+import types
+import unittest
+from unittest import mock
+
+import paddle
+
+from fastdeploy.model_executor.layers.attention import flash_attn_backend
+from fastdeploy.model_executor.layers.attention.flash_attn_backend import (
+    flash_attn_func,
+)
+
+
+class TestFlashAttnFunc(unittest.TestCase):
+    def setUp(self):
+        """
+        Set up the testing environment before each test..
+        """
+        paddle.set_device("gpu")
+        paddle.set_default_dtype("bfloat16")
+        prop = paddle.device.cuda.get_device_properties()
+        self.sm_version = prop.major * 10 + prop.minor
+
+    def test_fa3(self):
+        if self.sm_version < 89 or self.sm_version >= 100:
+            self.skipTest("Flash Attention V3 requires SM89+ but less than SM100.")
+        head_dim = 128
+        num_heads = 12
+        kv_num_heads = 4
+        seq_len = 1024
+        batch_size = 4
+        token_num = batch_size * seq_len
+        q = paddle.rand((token_num, num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+        k = paddle.rand((token_num, kv_num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+        v = paddle.rand((token_num, kv_num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+        cu_seqlens_q = paddle.arange(0, token_num + seq_len, seq_len, dtype=paddle.int32)
+        cu_seqlens_k = paddle.arange(0, token_num + seq_len, seq_len, dtype=paddle.int32)
+        max_seqlen_q = seq_len
+        max_seqlen_k = seq_len
+        attn_mask_q = None
+        paddle.set_flags({"FLAGS_flash_attn_version": 3})
+        flash_attn_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            attn_mask_q=attn_mask_q,
+            causal=True,
+            num_heads=num_heads,
+            kv_num_heads=kv_num_heads,
+            head_dim=head_dim,
+            version=3,
+        )
+
+    def test_fa3_with_mask(self):
+        if self.sm_version < 89 or self.sm_version >= 100:
+            self.skipTest("Flash Attention V3 requires SM89+ but less than SM100.")
+        head_dim = 128
+        num_heads = 12
+        kv_num_heads = 4
+        seq_len = 1024
+        batch_size = 4
+        token_num = batch_size * seq_len
+        q = paddle.rand((token_num, num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+        k = paddle.rand((token_num, kv_num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+        v = paddle.rand((token_num, kv_num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+        cu_seqlens_q = paddle.arange(0, token_num + seq_len, seq_len, dtype=paddle.int32)
+        cu_seqlens_k = paddle.arange(0, token_num + seq_len, seq_len, dtype=paddle.int32)
+        max_seqlen_q = seq_len
+        max_seqlen_k = seq_len
+
+        attn_mask_q = paddle.zeros([1, 1, token_num, 4], dtype=paddle.int32)
+        for bid in range(batch_size):
+            attn_mask_q[:, :, seq_len * bid : seq_len * (bid + 1), :2] = seq_len * (bid + 1)
+        for kv_token_id in range(token_num):
+            attn_mask_q[:, :, kv_token_id, 3] = kv_token_id
+        paddle.set_flags({"FLAGS_flash_attn_version": 3})
+        flash_attn_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            attn_mask_q=attn_mask_q,
+            causal=True,
+            num_heads=num_heads,
+            kv_num_heads=kv_num_heads,
+            head_dim=head_dim,
+            version=3,
+        )
+
+    def test_fa2(self):
+        head_dim = 128
+        num_heads = 12
+        kv_num_heads = 4
+        seq_len = 1024
+        batch_size = 4
+        token_num = batch_size * seq_len
+        q = paddle.rand((token_num, num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+        k = paddle.rand((token_num, kv_num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+        v = paddle.rand((token_num, kv_num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+        cu_seqlens_q = paddle.arange(0, token_num + seq_len, seq_len, dtype=paddle.int32)
+        cu_seqlens_k = paddle.arange(0, token_num + seq_len, seq_len, dtype=paddle.int32)
+        max_seqlen_q = seq_len
+        max_seqlen_k = seq_len
+        attn_mask_q = None
+        paddle.set_flags({"FLAGS_flash_attn_version": 2})
+        flash_attn_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            attn_mask_q=attn_mask_q,
+            causal=True,
+            num_heads=num_heads,
+            kv_num_heads=kv_num_heads,
+            head_dim=head_dim,
+            version=2,
+        )
+
+    def test_fa2_with_mask(self):
+        head_dim = 128
+        num_heads = 12
+        kv_num_heads = 4
+        seq_len = 1024
+        batch_size = 4
+        token_num = batch_size * seq_len
+        q = paddle.rand((token_num, num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+        k = paddle.rand((token_num, kv_num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+        v = paddle.rand((token_num, kv_num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+        cu_seqlens_q = paddle.arange(0, token_num + seq_len, seq_len, dtype=paddle.int32)
+        cu_seqlens_k = paddle.arange(0, token_num + seq_len, seq_len, dtype=paddle.int32)
+        max_seqlen_q = seq_len
+        max_seqlen_k = seq_len
+
+        attn_mask_q = paddle.zeros([1, 1, token_num, 4], dtype=paddle.int32)
+        for bid in range(batch_size):
+            attn_mask_q[:, :, seq_len * bid : seq_len * (bid + 1), :2] = seq_len * (bid + 1)
+        for kv_token_id in range(token_num):
+            attn_mask_q[:, :, kv_token_id, 3] = kv_token_id
+        paddle.set_flags({"FLAGS_flash_attn_version": 2})
+        flash_attn_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            attn_mask_q=attn_mask_q,
+            causal=True,
+            num_heads=num_heads,
+            kv_num_heads=kv_num_heads,
+            head_dim=head_dim,
+            version=2,
+        )
+
+    def test_fa4(self):
+        if self.sm_version < 100:
+            self.skipTest("Flash Attention V4 requires SM100+.")
+        head_dim = 128
+        num_heads = 12
+        kv_num_heads = 4
+        seq_len = 1024
+        batch_size = 4
+        token_num = batch_size * seq_len
+        q = paddle.rand((token_num, num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+        k = paddle.rand((token_num, kv_num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+        v = paddle.rand((token_num, kv_num_heads, head_dim), dtype=paddle.float32).cast("bfloat16")
+
+        attn_mask_q = paddle.zeros([1, 1, token_num, 4], dtype=paddle.int32)
+        for bid in range(batch_size):
+            attn_mask_q[:, :, seq_len * bid : seq_len * (bid + 1), :2] = seq_len * (bid + 1)
+        for kv_token_id in range(token_num):
+            attn_mask_q[:, :, kv_token_id, 3] = kv_token_id
+        flash_attn_func(
+            q,
+            k,
+            v,
+            attn_mask_q=attn_mask_q,
+            num_heads=num_heads,
+            kv_num_heads=kv_num_heads,
+            head_dim=head_dim,
+            version=4,
+        )
+
+
+class TestInitFlashAttnVersion(unittest.TestCase):
+    """Tests for the init_flash_attn_version FA4 import branch (sm>=100)."""
+
+    _MODULE_NAMES = (
+        "paddlefleet",
+        "paddlefleet.ops",
+        "paddlefleet.ops.flash_mask",
+        "paddlefleet.ops.flash_mask.cute",
+        "paddlefleet.ops.flash_mask.cute.interface",
+        "paddlefleet_ops",
+        "paddlefleet_ops.flash_mask",
+        "paddlefleet_ops.flash_mask.cute",
+        "paddlefleet_ops.flash_mask.cute.interface",
+    )
+
+    def setUp(self):
+        # Save state to restore after each test.
+        self._saved_version = flash_attn_backend.FLASH_ATTN_VERSION
+        self._saved_v4 = flash_attn_backend.flashmask_attention_v4
+        self._saved_modules = {name: sys.modules.get(name) for name in self._MODULE_NAMES}
+        # Make sure each test starts with a clean module state.
+        for name in self._MODULE_NAMES:
+            sys.modules.pop(name, None)
+
+    def _block_old_api(self):
+        """Force `paddlefleet.ops` import to fail regardless of what is installed."""
+        # Setting sys.modules[name] = None makes importlib.import_module raise ImportError.
+        sys.modules["paddlefleet"] = None
+        sys.modules["paddlefleet.ops"] = None
+
+    def _block_new_api(self):
+        """Force `paddlefleet_ops` import to fail regardless of what is installed."""
+        sys.modules["paddlefleet_ops"] = None
+
+    def tearDown(self):
+        flash_attn_backend.FLASH_ATTN_VERSION = self._saved_version
+        flash_attn_backend.flashmask_attention_v4 = self._saved_v4
+        for name, mod in self._saved_modules.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+
+    def _install_fake_paddlefleet_old_api(self, is_available: bool):
+        """Inject fake `paddlefleet.ops` (old API) modules."""
+        pkg = types.ModuleType("paddlefleet")
+        pkg.__path__ = []
+        ops = types.ModuleType("paddlefleet.ops")
+        ops.__path__ = []
+        ops.is_flash_mask_available = lambda: is_available
+        pkg.ops = ops
+        flash_mask = types.ModuleType("paddlefleet.ops.flash_mask")
+        flash_mask.__path__ = []
+        cute = types.ModuleType("paddlefleet.ops.flash_mask.cute")
+        cute.__path__ = []
+        interface = types.ModuleType("paddlefleet.ops.flash_mask.cute.interface")
+        interface.flashmask_attention = mock.MagicMock(name="fa4_old")
+
+        sys.modules["paddlefleet"] = pkg
+        sys.modules["paddlefleet.ops"] = ops
+        sys.modules["paddlefleet.ops.flash_mask"] = flash_mask
+        sys.modules["paddlefleet.ops.flash_mask.cute"] = cute
+        sys.modules["paddlefleet.ops.flash_mask.cute.interface"] = interface
+        return interface.flashmask_attention
+
+    def _install_fake_paddlefleet_new_api(self, is_available: bool):
+        """Inject fake `paddlefleet_ops` (new API) modules."""
+        ops = types.ModuleType("paddlefleet_ops")
+        ops.__path__ = []
+        ops.is_flash_mask_available = lambda: is_available
+        flash_mask = types.ModuleType("paddlefleet_ops.flash_mask")
+        flash_mask.__path__ = []
+        cute = types.ModuleType("paddlefleet_ops.flash_mask.cute")
+        cute.__path__ = []
+        interface = types.ModuleType("paddlefleet_ops.flash_mask.cute.interface")
+        interface.flashmask_attention = mock.MagicMock(name="fa4_new")
+
+        sys.modules["paddlefleet_ops"] = ops
+        sys.modules["paddlefleet_ops.flash_mask"] = flash_mask
+        sys.modules["paddlefleet_ops.flash_mask.cute"] = cute
+        sys.modules["paddlefleet_ops.flash_mask.cute.interface"] = interface
+        return interface.flashmask_attention
+
+    def test_fa4_old_api_import_success(self):
+        """Old API (`paddlefleet.ops`) is preferred when available."""
+        fake_fa4 = self._install_fake_paddlefleet_old_api(is_available=True)
+        # Also install new API to verify the old API takes precedence.
+        new_fa4 = self._install_fake_paddlefleet_new_api(is_available=True)
+        flash_attn_backend.FLASH_ATTN_VERSION = None
+        flash_attn_backend.flashmask_attention_v4 = None
+
+        with (
+            mock.patch.object(flash_attn_backend.current_platform, "is_cuda", return_value=True),
+            mock.patch.object(flash_attn_backend, "get_sm_version", return_value=100),
+            mock.patch.object(paddle, "enable_compat", create=True, return_value=None),
+        ):
+            flash_attn_backend.init_flash_attn_version()
+
+        self.assertEqual(flash_attn_backend.FLASH_ATTN_VERSION, 4)
+        self.assertIs(flash_attn_backend.flashmask_attention_v4, fake_fa4)
+        self.assertIsNot(flash_attn_backend.flashmask_attention_v4, new_fa4)
+
+    def test_fa4_old_api_flash_mask_unavailable(self):
+        """Old API present but `is_flash_mask_available` is False."""
+        self._install_fake_paddlefleet_old_api(is_available=False)
+        self._block_new_api()
+        flash_attn_backend.FLASH_ATTN_VERSION = None
+        flash_attn_backend.flashmask_attention_v4 = None
+
+        with (
+            mock.patch.object(flash_attn_backend.current_platform, "is_cuda", return_value=True),
+            mock.patch.object(flash_attn_backend, "get_sm_version", return_value=100),
+            mock.patch.object(paddle, "enable_compat", create=True, return_value=None),
+        ):
+            try:
+                flash_attn_backend.init_flash_attn_version()
+            except NameError:
+                pass
+
+        self.assertNotEqual(flash_attn_backend.FLASH_ATTN_VERSION, 4)
+
+    def test_fa4_new_api_import_success(self):
+        """Falls back to new API (`paddlefleet_ops`) when old API is missing."""
+        fake_fa4 = self._install_fake_paddlefleet_new_api(is_available=True)
+        self._block_old_api()
+        flash_attn_backend.FLASH_ATTN_VERSION = None
+        flash_attn_backend.flashmask_attention_v4 = None
+
+        with (
+            mock.patch.object(flash_attn_backend.current_platform, "is_cuda", return_value=True),
+            mock.patch.object(flash_attn_backend, "get_sm_version", return_value=100),
+            mock.patch.object(paddle, "enable_compat", create=True, return_value=None),
+        ):
+            flash_attn_backend.init_flash_attn_version()
+
+        self.assertEqual(flash_attn_backend.FLASH_ATTN_VERSION, 4)
+        self.assertIs(flash_attn_backend.flashmask_attention_v4, fake_fa4)
+
+    def test_fa4_new_api_flash_mask_unavailable(self):
+        """New API present but `is_flash_mask_available` is False."""
+        self._install_fake_paddlefleet_new_api(is_available=False)
+        self._block_old_api()
+        flash_attn_backend.FLASH_ATTN_VERSION = None
+        flash_attn_backend.flashmask_attention_v4 = None
+
+        with (
+            mock.patch.object(flash_attn_backend.current_platform, "is_cuda", return_value=True),
+            mock.patch.object(flash_attn_backend, "get_sm_version", return_value=100),
+            mock.patch.object(paddle, "enable_compat", create=True, return_value=None),
+        ):
+            try:
+                flash_attn_backend.init_flash_attn_version()
+            except NameError:
+                pass
+
+        self.assertNotEqual(flash_attn_backend.FLASH_ATTN_VERSION, 4)
+
+    def test_fa4_paddlefleet_import_error(self):
+        """Neither old nor new API is importable."""
+        self._block_old_api()
+        self._block_new_api()
+        flash_attn_backend.FLASH_ATTN_VERSION = None
+        flash_attn_backend.flashmask_attention_v4 = None
+
+        with (
+            mock.patch.object(flash_attn_backend.current_platform, "is_cuda", return_value=True),
+            mock.patch.object(flash_attn_backend, "get_sm_version", return_value=100),
+            mock.patch.object(paddle, "enable_compat", create=True, return_value=None),
+        ):
+            try:
+                flash_attn_backend.init_flash_attn_version()
+            except NameError:
+                pass
+
+        self.assertNotEqual(flash_attn_backend.FLASH_ATTN_VERSION, 4)
+
+
+if __name__ == "__main__":
+    unittest.main()

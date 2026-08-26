@@ -15,7 +15,7 @@
 
 #include "speculate_write_cache_with_rope_impl.cuh"
 
-template <typename T, typename QKV_TYPE = int>
+template <typename T, typename QKV_TYPE = int, bool EnforceFmulRN = false>
 void SpeculateWriteCacheWithRoPEKernel(
     const AppendAttnMetaData& meta_data,
     const paddle::Tensor&
@@ -23,8 +23,8 @@ void SpeculateWriteCacheWithRoPEKernel(
               // gqa_group_size, head_dim] if GQA)
     const paddle::Tensor& seq_lens,
     const paddle::Tensor& seq_lens_encoder,
-    const paddle::Tensor& padding_offsets,
-    const paddle::Tensor& cum_offsets,
+    const paddle::Tensor& batch_id_per_token,
+    const paddle::Tensor& cu_seqlens_q,
     const paddle::Tensor& block_tables,
     const paddle::optional<paddle::Tensor>& rotary_embs,
     const paddle::optional<paddle::Tensor>& qkv_out_scales,
@@ -35,8 +35,12 @@ void SpeculateWriteCacheWithRoPEKernel(
     const paddle::optional<paddle::Tensor>& cache_v_zp,
     const std::string& cache_quant_type_str,
     const bool use_neox_rotary_style,
+    const bool rope_3d,
     const int max_seq_len,
     cudaStream_t& stream,
     paddle::Tensor* qkv_out,
     paddle::Tensor* key_cache_out,
-    paddle::Tensor* value_cache_out);
+    paddle::Tensor* value_cache_out,
+    const paddle::optional<paddle::Tensor>& q_norm_weight,
+    const paddle::optional<paddle::Tensor>& k_norm_weight,
+    const float rms_norm_eps);

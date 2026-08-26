@@ -12,263 +12,289 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-Utility functions and classes for FastDeploy server operations.
-This module provides:
-- Custom logging handlers and formatters
-- File download and extraction utilities
-- Configuration parsing helpers
-- Various helper functions for server operations
 """
 
 import argparse
-import codecs
+import asyncio
+import hashlib
 import importlib
-import logging
+import json
 import os
-import re
+import pickle
+import random
 import socket
+import subprocess
+import sys
 import tarfile
 import time
+import traceback
 from datetime import datetime
-from logging.handlers import BaseRotatingHandler
-from pathlib import Path
+from enum import Enum
+from functools import cache
+from http import HTTPStatus
+from importlib.metadata import PackageNotFoundError, distribution
+from typing import Any, Dict, Literal, TypeVar, Union
 
+import numpy as np
+import paddle
 import requests
 import yaml
+from aistudio_sdk.snapshot_download import snapshot_download as aistudio_download
+from fastapi import Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from tqdm import tqdm
+from typing_extensions import TypeIs, assert_never
+
+from fastdeploy import envs
+from fastdeploy.entrypoints.openai.protocol import ErrorInfo, ErrorResponse
+from fastdeploy.logger.request_logger import log_request_error
+from fastdeploy.worker.output import PromptLogprobs
+
+T = TypeVar("T")
+from typing import Callable, List, Optional
+
+# [N,2] -> every line is [config_name, enable_xxx_name]
+# Make sure enable_xxx equal to config.enable_xxx
+ARGS_CORRECTION_LIST = [
+    ["early_stop_config", "enable_early_stop"],
+]
+
+FASTDEPLOY_SUBCMD_PARSER_EPILOG = (
+    "Tip: Use `fastdeploy [serve|run-batch|bench <bench_type>] "
+    "--help=<keyword>` to explore arguments from help.\n"
+    "   - To view a argument group:     --help=ModelConfig\n"
+    "   - To view a single argument:    --help=max-num-seqs\n"
+    "   - To search by keyword:         --help=max\n"
+    "   - To list all groups:           --help=listgroup\n"
+    "   - To view help with pager:      --help=page"
+)
+
+
+CHOICE_SEPARATOR = "::n::"
+
+
+def make_choice_id(request_id: str, index: int) -> str:
+    """Construct an internal request ID that encodes the choice index."""
+    return f"{request_id}{CHOICE_SEPARATOR}{index}"
+
+
+def parse_choice_id(compound_id: str) -> tuple:
+    """Parse an internal request ID back into (base_request_id, choice_index).
+    Returns (compound_id, None) if no choice index is encoded.
+    """
+    if CHOICE_SEPARATOR in compound_id:
+        base, idx = compound_id.rsplit(CHOICE_SEPARATOR, 1)
+        return base, int(idx)
+    return compound_id, None
+
+
+def get_base_request_id(compound_id: str) -> str:
+    """Extract the base request ID, stripping any choice index suffix."""
+    if CHOICE_SEPARATOR in compound_id:
+        return compound_id.rsplit(CHOICE_SEPARATOR, 1)[0]
+    return compound_id
+
+
+def get_choice_index(compound_id: str) -> int:
+    """Extract the choice index from a compound request ID.
+    Returns the index, or raises ValueError if not present.
+    """
+    if CHOICE_SEPARATOR in compound_id:
+        return int(compound_id.rsplit(CHOICE_SEPARATOR, 1)[1])
+    raise ValueError(f"No choice index in request_id: {compound_id}")
+
+
+def show_filtered_argument_or_group_from_help(parser: argparse.ArgumentParser, subcommand_name: list[str]):
+
+    # Only handle --help=<keyword> for the current subcommand.
+    # Since subparser_init() runs for all subcommands during CLI setup,
+    # we skip processing if the subcommand name is not in sys.argv.
+    # sys.argv[0] is the program name. The subcommand follows.
+    # e.g., for `vllm bench latency`,
+    # sys.argv is `['vllm', 'bench', 'latency', ...]`
+    # and subcommand_name is "bench latency".
+    if len(sys.argv) <= len(subcommand_name) or sys.argv[1 : 1 + len(subcommand_name)] != subcommand_name:
+        return
+
+    for arg in sys.argv:
+        if arg.startswith("--help="):
+            search_keyword = arg.split("=", 1)[1]
+
+            # Enable paged view for full help
+            if search_keyword == "page":
+                help_text = parser.format_help()
+                _output_with_pager(help_text)
+                sys.exit(0)
+
+            # List available groups
+            if search_keyword == "listgroup":
+                output_lines = ["\nAvailable argument groups:"]
+                for group in parser._action_groups:
+                    if group.title and not group.title.startswith("positional arguments"):
+                        output_lines.append(f"  - {group.title}")
+                        if group.description:
+                            output_lines.append("    " + group.description.strip())
+                        output_lines.append("")
+                _output_with_pager("\n".join(output_lines))
+                sys.exit(0)
+
+            # For group search
+            formatter = parser._get_formatter()
+            for group in parser._action_groups:
+                if group.title and group.title.lower() == search_keyword.lower():
+                    formatter.start_section(group.title)
+                    formatter.add_text(group.description)
+                    formatter.add_arguments(group._group_actions)
+                    formatter.end_section()
+                    _output_with_pager(formatter.format_help())
+                    sys.exit(0)
+
+            # For single arg
+            matched_actions = []
+
+            for group in parser._action_groups:
+                for action in group._group_actions:
+                    # search option name
+                    if any(search_keyword.lower() in opt.lower() for opt in action.option_strings):
+                        matched_actions.append(action)
+
+            if matched_actions:
+                header = f"\nParameters matching '{search_keyword}':\n"
+                formatter = parser._get_formatter()
+                formatter.add_arguments(matched_actions)
+                _output_with_pager(header + formatter.format_help())
+                sys.exit(0)
+
+            print(f"\nNo group or parameter matching '{search_keyword}'")
+            print("Tip: use `--help=listgroup` to view all groups.")
+            sys.exit(1)
+
+
+def _output_with_pager(text: str):
+    """Output text using scrolling view if available and appropriate."""
+
+    pagers = ["less -R", "more"]
+    for pager_cmd in pagers:
+        try:
+            proc = subprocess.Popen(pager_cmd.split(), stdin=subprocess.PIPE, text=True)
+            proc.communicate(input=text)
+            return
+        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+            continue
+
+    # No pager worked, fall back to normal print
+    print(text)
 
 
 class EngineError(Exception):
-    """Base exception class for engine-related errors.
-    
-    Attributes:
-        message (str): Human-readable error description
-        error_code (int): HTTP-style error code (default: 400)
-    """
+    """Base exception class for engine errors"""
 
     def __init__(self, message, error_code=400):
         super().__init__(message)
         self.error_code = error_code
 
 
-class ColoredFormatter(logging.Formatter):
-    """Custom log formatter that adds color to console output.
-    
-    Colors different log levels for better visibility:
-    - WARNING: Yellow
-    - ERROR: Red
-    - CRITICAL: Red
-    """
-    COLOR_CODES = {
-        logging.WARNING: 33,  # 黄色
-        logging.ERROR: 31,  # 红色
-        logging.CRITICAL: 31,  # 红色
-    }
-
-    def format(self, record):
-        color_code = self.COLOR_CODES.get(record.levelno, 0)
-        prefix = f'\033[{color_code}m'
-        suffix = '\033[0m'
-        message = super().format(record)
-        if color_code:
-            message = f"{prefix}{message}{suffix}"
-        return message
+class ParameterError(Exception):
+    def __init__(self, param: str, message: str):
+        self.param = param
+        self.message = message
+        super().__init__(message)
 
 
-class DailyRotatingFileHandler(BaseRotatingHandler):
-    """Daily rotating file handler that supports multi-process logging.
-    
-    Similar to `logging.TimedRotatingFileHandler` but designed to work safely
-    in multi-process environments.
-    """
+class ExceptionHandler:
 
-    def __init__(self,
-                 filename,
-                 backupCount=0,
-                 encoding="utf-8",
-                 delay=False,
-                 utc=False,
-                 **kwargs):
-        """Initialize the rotating file handler.
+    # 全局异常兜底处理
+    @staticmethod
+    async def handle_exception(request: Request, exc: Exception) -> JSONResponse:
+        error = ErrorResponse(error=ErrorInfo(message=str(exc), type=ErrorType.INTERNAL_ERROR))
+        return JSONResponse(content=error.model_dump(), status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
 
-        Args:
-            filename (str): Path to the log file (can be relative or absolute)
-            backupCount (int, optional): Number of backup files to keep. Defaults to 0.
-            encoding (str, optional): File encoding. Defaults to "utf-8".
-            delay (bool, optional): Delay file opening until first write. Defaults to False.
-            utc (bool, optional): Use UTC timezone for rollover. Defaults to False.
-            **kwargs: Additional arguments passed to BaseRotatingHandler.
-
-        Raises:
-            TypeError: If filename is not a string.
-            ValueError: If backupCount is less than 0.
-        """
-        self.backup_count = backupCount
-        self.utc = utc
-        self.suffix = "%Y-%m-%d"
-        self.base_log_path = Path(filename)
-        self.base_filename = self.base_log_path.name
-        self.current_filename = self._compute_fn()
-        self.current_log_path = self.base_log_path.with_name(
-            self.current_filename)
-        BaseRotatingHandler.__init__(self, filename, "a", encoding, delay)
-
-    def shouldRollover(self, record):
-        """Determine if a rollover should occur.
-        
-        Args:
-            record (LogRecord): The log record being processed
-            
-        Returns:
-            bool: True if rollover should occur, False otherwise
-        """
-        if self.current_filename != self._compute_fn():
-            return True
-        return False
-
-    def doRollover(self):
-        """Perform the actual rollover operation.
-        
-        Closes current file, creates new log file with current date suffix,
-        and deletes any expired log files.
-        """
-        if self.stream:
-            self.stream.close()
-            self.stream = None
-
-        self.current_filename = self._compute_fn()
-        self.current_log_path = self.base_log_path.with_name(
-            self.current_filename)
-
-        if not self.delay:
-            self.stream = self._open()
-
-        self.delete_expired_files()
-
-    def _compute_fn(self):
-        """Compute the current log filename with date suffix.
-        
-        Returns:
-            str: Filename with current date suffix (format: filename.YYYY-MM-DD)
-        """
-        return self.base_filename + "." + time.strftime(
-            self.suffix, time.localtime())
-
-    def _open(self):
-        """Open the current log file.
-        
-        Also creates a symlink from the base filename to the current log file.
-        
-        Returns:
-            file object: The opened log file
-        """
-        if self.encoding is None:
-            stream = open(str(self.current_log_path), self.mode)
+    # 处理请求参数验证异常
+    @staticmethod
+    async def handle_request_validation_exception(request: Request, exc: RequestValidationError) -> JSONResponse:
+        errors = exc.errors()
+        if not errors:
+            message = str(exc)
+            param = None
         else:
-            stream = codecs.open(str(self.current_log_path), self.mode,
-                                 self.encoding)
+            first_error = errors[0]
+            loc = first_error.get("loc", [])
+            param = loc[-1] if loc else None
+            message = first_error.get("msg", str(exc))
 
-        if self.base_log_path.exists():
-            try:
-                if (not self.base_log_path.is_symlink() or os.readlink(
-                        self.base_log_path) != self.current_filename):
-                    os.remove(self.base_log_path)
-            except OSError:
-                pass
-
+        # Try to extract request_id from request body
+        request_id = None
         try:
-            os.symlink(self.current_filename, str(self.base_log_path))
-        except OSError:
+            body = await request.body()
+            if body:
+                import json
+
+                body_json = json.loads(body)
+                request_id = body_json.get("request_id")
+        except Exception:
             pass
-        return stream
 
-    def delete_expired_files(self):
-        """Delete expired log files based on backup count.
-        
-        Only keeps the most recent backupCount files and deletes older ones.
-        Does nothing if backupCount is <= 0.
-        """
-        if self.backup_count <= 0:
-            return
-
-        file_names = os.listdir(str(self.base_log_path.parent))
-        result = []
-        prefix = self.base_filename + "."
-        plen = len(prefix)
-        for file_name in file_names:
-            if file_name[:plen] == prefix:
-                suffix = file_name[plen:]
-                if re.match(r"^\d{4}-\d{2}-\d{2}(\.\w+)?$", suffix):
-                    result.append(file_name)
-        if len(result) < self.backup_count:
-            result = []
-        else:
-            result.sort()
-            result = result[:len(result) - self.backup_count]
-
-        for file_name in result:
-            os.remove(str(self.base_log_path.with_name(file_name)))
+        err = ErrorResponse(
+            error=ErrorInfo(
+                message=message,
+                type=ErrorType.INVALID_REQUEST_ERROR,
+                code=ErrorCode.MISSING_REQUIRED_PARAMETER if param == "messages" else ErrorCode.INVALID_VALUE,
+                param=param,
+            )
+        )
+        log_request_error(
+            message="request[{request_id}] invalid_request_error: {url} {param} {msg}",
+            request_id=request_id or "unknown",
+            url=str(request.url),
+            param=param,
+            msg=message,
+        )
+        return JSONResponse(content=err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
 
 
-def get_logger(name,
-               file_name,
-               without_formater=False,
-               print_to_console=False):
-    """Create and configure a logger instance.
-    
-    Args:
-        name (str): Logger name
-        file_name (str): Log file name (without path)
-        without_formater (bool, optional): Skip adding formatter. Defaults to False.
-        print_to_console (bool, optional): Also log to console. Defaults to False.
-        
-    Returns:
-        Logger: Configured logger instance
-    """
-    log_dir = os.getenv("FD_LOG_DIR", default="log")
-    if not os.path.exists(log_dir):
-        os.mkdir(log_dir)
-    is_debug = int(os.getenv("FD_DEBUG", default="0"))
-    logger = logging.getLogger(name)
-    if is_debug:
-        logger.setLevel(level=logging.DEBUG)
-    else:
-        logger.setLevel(level=logging.INFO)
+class ErrorType(str, Enum):
+    INVALID_REQUEST_ERROR = "invalid_request_error"
+    TIMEOUT_ERROR = "timeout_error"
+    SERVER_ERROR = "server_error"
+    INTERNAL_ERROR = "internal_error"
+    API_CONNECTION_ERROR = "api_connection_error"
 
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
 
-    LOG_FILE = "{0}/{1}".format(log_dir, file_name)
-    backup_count = int(os.getenv("FD_LOG_BACKUP_COUNT", "7"))
-    handler = DailyRotatingFileHandler(LOG_FILE, backupCount=backup_count)
-    formatter = ColoredFormatter(
-        "%(levelname)-8s %(asctime)s %(process)-5s %(filename)s[line:%(lineno)d] %(message)s"
-    )
+class ErrorCode(str, Enum):
+    INVALID_VALUE = "invalid_value"
+    CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
+    MODEL_NOT_SUPPORT = "model_not_support"
+    TIMEOUT = "timeout"
+    CONNECTION_ERROR = "connection_error"
+    MISSING_REQUIRED_PARAMETER = "missing_required_parameter"
+    INTERNAL_ERROR = "internal_error"
+    CLIENT_ABORTED = "client_aborted"
 
-    console_handler = logging.StreamHandler()
-    if not without_formater:
-        handler.setFormatter(formatter)
-        console_handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    if print_to_console:
-        logger.addHandler(console_handler)
-    handler.propagate = False
-    console_handler.propagate = False
-    return logger
+
+# Backward compatibility: logger classes have been moved to fastdeploy.logger module
+# Use lazy import to avoid circular dependencies
+def __getattr__(name):
+    if name == "ColoredFormatter":
+        from fastdeploy.logger.formatters import ColoredFormatter
+
+        return ColoredFormatter
+    elif name == "DailyRotatingFileHandler":
+        from fastdeploy.logger.handlers import DailyRotatingFileHandler
+
+        return DailyRotatingFileHandler
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def chunk_list(lst: list[T], chunk_size: int):
+    """Yield successive chunk_size chunks from lst."""
+    for i in range(0, len(lst), chunk_size):
+        yield lst[i : i + chunk_size]
 
 
 def str_to_datetime(date_string):
-    """Convert string to datetime object.
-    
-    Supports both formats with and without microseconds.
-    
-    Args:
-        date_string (str): Date string in format "YYYY-MM-DD HH:MM:SS" or 
-                          "YYYY-MM-DD HH:MM:SS.microseconds"
-                          
-    Returns:
-        datetime: Parsed datetime object
+    """
+    string to datetime class object
     """
     if "." in date_string:
         return datetime.strptime(date_string, "%Y-%m-%d %H:%M:%S.%f")
@@ -277,14 +303,15 @@ def str_to_datetime(date_string):
 
 
 def datetime_diff(datetime_start, datetime_end):
-    """Calculate time difference between two datetime points.
-    
+    """
+    Calculate the difference between two dates and times(s)
+
     Args:
-        datetime_start (Union[str, datetime.datetime]): Start time
-        datetime_end (Union[str, datetime.datetime]): End time
-        
+        datetime_start (Union[str, datetime.datetime]): start time
+        datetime_end (Union[str, datetime.datetime]): end time
+
     Returns:
-        float: Time difference in seconds (always positive)
+        float: date time difference(s)
     """
     if isinstance(datetime_start, str):
         datetime_start = str_to_datetime(datetime_start)
@@ -298,29 +325,20 @@ def datetime_diff(datetime_start, datetime_end):
 
 
 def download_file(url, save_path):
-    """Download a file from URL with progress bar.
-    
-    Args:
-        url (str): File URL to download
-        save_path (str): Local path to save the file
-        
-    Returns:
-        bool: True if download succeeded
-        
-    Raises:
-        RuntimeError: If download fails (file is deleted on failure)
-    """
+    """Download file with progress bar"""
     try:
         response = requests.get(url, stream=True)
         response.raise_for_status()
 
-        total_size = int(response.headers.get('content-length', 0))
-        progress_bar = tqdm(total=total_size,
-                            unit='iB',
-                            unit_scale=True,
-                            desc=f"Downloading {os.path.basename(url)}")
+        total_size = int(response.headers.get("content-length", 0))
+        progress_bar = tqdm(
+            total=total_size,
+            unit="iB",
+            unit_scale=True,
+            desc=f"Downloading {os.path.basename(url)}",
+        )
 
-        with open(save_path, 'wb') as f:
+        with open(save_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=1024):
                 if chunk:  # filter out keep-alive chunks
                     f.write(chunk)
@@ -331,19 +349,11 @@ def download_file(url, save_path):
     except Exception as e:
         if os.path.exists(save_path):
             os.remove(save_path)
-        raise RuntimeError(f"Download failed: {str(e)}")
+        raise RuntimeError(f"Download failed: {e!s}")
 
 
 def extract_tar(tar_path, output_dir):
-    """Extract contents of a tar file with progress tracking.
-    
-    Args:
-        tar_path (str): Path to tar file
-        output_dir (str): Directory to extract files to
-        
-    Raises:
-        RuntimeError: If extraction fails
-    """
+    """Extract tar file with progress tracking"""
     try:
         with tarfile.open(tar_path) as tar:
             members = tar.getmembers()
@@ -353,23 +363,40 @@ def extract_tar(tar_path, output_dir):
                     pbar.update(1)
         print(f"Successfully extracted to: {output_dir}")
     except Exception as e:
-        raise RuntimeError(f"Extraction failed: {str(e)}")
+        raise RuntimeError(f"Extraction failed: {e!s}")
+
+
+def set_random_seed(seed: int) -> None:
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        paddle.seed(seed)
+
+
+def get_limited_max_value(max_value):
+    def validator(value):
+        value = float(value)
+        if value > max_value:
+            raise argparse.ArgumentTypeError(f"The value cannot exceed {max_value}")
+        return value
+
+    return validator
 
 
 def download_model(url, output_dir, temp_tar):
-    """Download and extract a model from URL.
-    
+    """
+    下载模型，并将其解压到指定目录。
+
     Args:
-        url (str): Model file URL
-        output_dir (str): Directory to save extracted model
-        temp_tar (str): Temporary tar filename for download
-        
+        url (str): 模型文件的URL地址。
+        output_dir (str): 模型文件要保存的目录路径。
+        temp_tar (str, optional): 临时保存模型文件的TAR包名称，默认为'temp.tar'.
+
     Raises:
-        Exception: If download or extraction fails
-        RuntimeError: With link to model documentation if failure occurs
-        
-    Note:
-        Cleans up temporary files even if operation fails
+        Exception: 如果下载或解压过程中出现任何错误，都会抛出Exception异常。
+
+    Returns:
+        None - 无返回值，只是在下载和解压过程中进行日志输出和清理临时文件。
     """
     try:
         temp_tar = os.path.join(output_dir, temp_tar)
@@ -395,117 +422,69 @@ def download_model(url, output_dir, temp_tar):
 
 
 class FlexibleArgumentParser(argparse.ArgumentParser):
-    """Extended ArgumentParser that supports loading parameters from YAML files.
-    
-    Supports nested configuration structures in YAML that get flattened
-    into command-line style arguments.
+    """
+    Extend argparse.ArgumentParser to support loading parameters from YAML files.
     """
 
-    def __init__(self, *args, config_arg='--config', sep='_', **kwargs):
+    def __init__(self, *args, config_arg="--config", sep="_", **kwargs):
         super().__init__(*args, **kwargs)
-        self.sep = sep  # 用于展平嵌套字典的分隔符
-        # 创建临时解析器，仅用于解析 --config 参数
+        self.sep = sep
+
+        # Create parser to prase yaml file
         self.tmp_parser = argparse.ArgumentParser(add_help=False)
-        self.tmp_parser.add_argument(config_arg,
-                                     type=str,
-                                     help='Path to YAML config file')
+        self.tmp_parser.add_argument(config_arg, type=str, help="Path to YAML config file")
 
     def parse_args(self, args=None, namespace=None):
-        """Parse arguments with support for YAML configuration files.
-        
-        Args:
-            args: Argument strings to parse (default: sys.argv[1:])
-            namespace: Namespace object to store attributes (default: new Namespace)
-            
-        Returns:
-            Namespace: populated namespace object
-            
-        Note:
-            Command line arguments override values from config file
-        """
-        # 使用临时解析器解析出 --config 参数
         tmp_ns, remaining_args = self.tmp_parser.parse_known_args(args=args)
         config_path = tmp_ns.config
 
-        # 加载 YAML 文件并展平嵌套结构
         config = {}
         if config_path:
-            with open(config_path, 'r') as f:
+            with open(config_path, "r") as f:
                 loaded_config = yaml.safe_load(f)
-                config = self._flatten_dict(loaded_config)
+                config = loaded_config
 
-        # 获取所有已定义参数的 dest 名称
-        defined_dests = {action.dest for action in self._actions}
+        # Get declared parameters
+        defined_actions = {action.dest: action for action in self._actions}
+        filtered_config = {k: v for k, v in config.items() if k in defined_actions}
 
-        # 过滤出已定义的参数
-        filtered_config = {
-            k: v
-            for k, v in config.items() if k in defined_dests
-        }
-
-        # 创建或使用现有的命名空间对象
+        # Set parameters
         if namespace is None:
             namespace = argparse.Namespace()
-
-        # 将配置参数设置到命名空间
         for key, value in filtered_config.items():
+            action = defined_actions[key]
+            if action.type is not None and isinstance(value, (str, int, float)):
+                try:
+                    str_value = str(value).strip()
+                    if str_value == "":
+                        converted = None
+                    else:
+                        converted = action.type(str_value)
+                    value = converted
+                except Exception as e:
+                    llm_logger.error(f"Error converting '{key}' with value '{value}': {e}, {traceback.format_exc()}")
             setattr(namespace, key, value)
+        args = super().parse_args(args=remaining_args, namespace=namespace)
 
-        # 解析剩余参数并覆盖默认值
-        return super().parse_args(args=remaining_args, namespace=namespace)
-
-    def _flatten_dict(self, d):
-        """Flatten nested dictionary into single level with joined keys.
-        
-        Args:
-            d (dict): Nested dictionary to flatten
-            
-        Returns:
-            dict: Flattened dictionary with keys joined by separator
-        """
-
-        def _flatten(d, parent_key=''):
-            items = []
-            for k, v in d.items():
-                new_key = f"{parent_key}{self.sep}{k}" if parent_key else k
-                if isinstance(v, dict):
-                    items.extend(_flatten(v, new_key).items())
-                else:
-                    items.append((new_key, v))
-            return dict(items)
-
-        return _flatten(d)
+        # Args correction
+        for config_name, flag_name in ARGS_CORRECTION_LIST:
+            if hasattr(args, config_name) and hasattr(args, flag_name):
+                # config is a dict
+                config = getattr(args, config_name, None)
+                if config is not None and flag_name in config.keys():
+                    setattr(args, flag_name, config[flag_name])
+        return args
 
 
 def resolve_obj_from_strname(strname: str):
-    """Import and return an object from its full dotted path string.
-    
-    Args:
-        strname (str): Full dotted path to object (e.g. "module.submodule.Class")
-        
-    Returns:
-        object: The imported object
-        
-    Example:
-        >>> resolve_obj_from_strname("os.path.join")
-        <function join at 0x...>
-    """
     module_name, obj_name = strname.rsplit(".", 1)
     module = importlib.import_module(module_name)
     return getattr(module, obj_name)
 
 
 def check_unified_ckpt(model_dir):
-    """Check if directory contains a PaddleNLP unified checkpoint.
-    
-    Args:
-        model_dir (str): Path to model directory
-        
-    Returns:
-        bool: True if valid unified checkpoint, False otherwise
-        
-    Raises:
-        Exception: If checkpoint appears corrupted
+    """
+    Check if the model is a PaddleNLP unified checkpoint
     """
     model_files = list()
     all_files = os.listdir(model_dir)
@@ -522,55 +501,808 @@ def check_unified_ckpt(model_dir):
 
     try:
         # check all the file exists
-        safetensors_num = int(
-            model_files[0].strip(".safetensors").split("-")[-1])
+        safetensors_num = int(model_files[0].strip(".safetensors").split("-")[-1]) + 1
         flags = [0] * safetensors_num
         for x in model_files:
             current_index = int(x.strip(".safetensors").split("-")[1])
             flags[current_index - 1] = 1
         assert sum(flags) == len(
             model_files
-        ), "Number of safetensor files should be {}, but now it's {}".format(
-            len(model_files), sum(flags))
+        ), f"Number of safetensor files should be {len(model_files)}, but now it's {sum(flags)}"
     except Exception as e:
         raise Exception(f"Failed to check unified checkpoint, details: {e}.")
     return is_unified_ckpt
 
 
 def get_host_ip():
-    """Get host machine's IP address.
-    
-    Returns:
-        str: Host IP address
+    """
+    Get host IP address
     """
     ip = socket.gethostbyname(socket.gethostname())
     return ip
 
 
+def get_random_port():
+    while True:
+        port = random.randint(49152, 65535)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("0.0.0.0", port))
+                return port
+            except OSError:
+                continue
+
+
+def parse_ports(ports):
+    if ports is None:
+        return None
+    elif isinstance(ports, int):
+        return [ports]
+    elif isinstance(ports, str):
+        return [int(p) for p in ports.split(",")]
+    elif isinstance(ports, list):
+        return [int(p) for p in ports]
+    else:
+        raise TypeError(f"Cannot parse ports into List[int]: {ports}")
+
+
 def is_port_available(host, port):
-    """Check if a network port is available for binding.
-    
-    Args:
-        host (str): Hostname or IP address
-        port (int): Port number
-        
-    Returns:
-        bool: True if port is available, False if already in use
+    """
+    Check the port is available
     """
     import errno
     import socket
+
+    # If FD_ENGINE_TASK_QUEUE_WITH_SHM is enabled, then check the file socket is available
+    if envs.FD_ENGINE_TASK_QUEUE_WITH_SHM:
+        socket_path = f"/dev/shm/fd_task_queue_{port}.sock"
+        if not is_file_socket_available(socket_path):
+            return False
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((host, port))
             return True
-        except socket.error as e:
+        except OSError as e:
             if e.errno == errno.EADDRINUSE:
                 return False
             return True
 
 
-llm_logger = get_logger("fastdeploy", "fastdeploy.log")
-data_processor_logger = get_logger("data_processor", "data_processor.log")
-api_server_logger = get_logger("api_server", "api_server.log")
-console_logger = get_logger("console", "console.log", print_to_console=True)
+def is_file_socket_available(socket_path):
+    """
+    Check the Unix domain socket (file socket) is available.
+
+    Args:
+        socket_path: Path to the socket file, e.g. /dev/shm/fd_task_queue_8000.sock
+
+    Returns:
+        True if the socket is available (not in use), False otherwise.
+    """
+    import errno
+    import os
+    import socket
+
+    if not os.path.exists(socket_path):
+        return True
+
+    # File exists, try to connect to see if someone is listening
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        try:
+            s.connect(socket_path)
+            return False
+        except OSError as e:
+            if e.errno in (errno.ECONNREFUSED, errno.ENOENT):
+                # Stale socket file: exists but nobody is listening
+                return True
+            return False
+
+
+def find_free_ports(
+    port_range: tuple[int, int] = (8000, 65535),
+    num_ports: int = 1,
+    host: str = "0.0.0.0",
+) -> list[int]:
+    """
+    Find available TCP ports in a given range, scanning from a random start.
+
+    Args:
+        port_range: (start, end), inclusive, e.g. (20000, 30000).
+        num_ports: number of ports to find.
+        host: host to bind, default "0.0.0.0".
+
+    Returns:
+        List of available ports with length == num_ports.
+
+    Raises:
+        ValueError: invalid port range or num_ports <= 0.
+        RuntimeError: not enough free ports in the range.
+    """
+    start, end = port_range
+    if start < 0 or end > 65535 or start > end:
+        raise ValueError(f"Invalid port range: {port_range}")
+
+    if num_ports <= 0:
+        raise ValueError("num_ports must be a positive integer")
+
+    total_ports = end - start + 1
+    if num_ports > total_ports:
+        raise ValueError("num_ports is larger than range size")
+
+    # Generate all ports and rotate with a random start index
+    ports = list(range(start, end + 1))
+    offset = random.randint(0, total_ports - 1)
+    ports = ports[offset:] + ports[:offset]
+
+    free_ports: list[int] = []
+
+    for port in ports:
+        if is_port_available(host, port):
+            free_ports.append(port)
+
+        if len(free_ports) >= num_ports:
+            break
+
+    if len(free_ports) < num_ports:
+        raise RuntimeError(f"Only found {len(free_ports)} free ports in {port_range}, requested {num_ports}.")
+
+    return free_ports
+
+
+def singleton(cls):
+    """
+    Singleton decorator for a class.
+    """
+    instances = {}
+
+    def get_instance(*args, **kwargs):
+        if cls not in instances:
+            instances[cls] = cls(*args, **kwargs)
+        return instances[cls]
+
+    return get_instance
+
+
+def print_gpu_memory_use(title: str, gpu_id: int, device_id: int | None = None) -> None:
+    """Print memory usage"""
+    import pynvml
+
+    if device_id is None:
+        device_id = gpu_id
+
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+    meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    pynvml.nvmlShutdown()
+
+    paddle_max_reserved = paddle.device.cuda.max_memory_reserved(gpu_id)
+    paddle_max_allocated = paddle.device.cuda.max_memory_allocated(gpu_id)
+    paddle_reserved = paddle.device.cuda.memory_reserved(gpu_id)
+    paddle_allocated = paddle.device.cuda.memory_allocated(gpu_id)
+
+    print(
+        f"\n{title}:",
+        f"\n\tDevice Total memory(GiB): {meminfo.total / 1024.0 / 1024.0 / 1024.0}",
+        f"\n\tDevice Used memory(GiB): {meminfo.used / 1024.0 / 1024.0 / 1024.0}",
+        f"\n\tDevice Free memory(GiB): {meminfo.free / 1024.0 / 1024.0 / 1024.0}",
+        f"\n\tPaddle max memory Reserved(GiB): {paddle_max_reserved / 1024.0 / 1024.0 / 1024.0}",
+        f"\n\tPaddle max memory Allocated(GiB): {paddle_max_allocated / 1024.0 / 1024.0 / 1024.0}",
+        f"\n\tPaddle memory Reserved(GiB): {paddle_reserved / 1024.0 / 1024.0 / 1024.0}",
+        f"\n\tPaddle memory Allocated(GiB): {paddle_allocated / 1024.0 / 1024.0 / 1024.0}\n",
+    )
+
+
+def ceil_div(x: int, y: int) -> int:
+    """
+    Perform ceiling division of two integers.
+
+    Args:
+        x: the dividend.
+        y: the divisor.
+
+    Returns:
+        The result of the ceiling division.
+    """
+    return (x + y - 1) // y
+
+
+def none_or_str(value):
+    """
+    Keep parameters None, not the string "None".
+    """
+    return None if value == "None" else value
+
+
+def retrive_model_from_server(model_name_or_path, revision="master"):
+    """
+    Download pretrained model from AIStudio, MODELSCOPE or HUGGINGFACE automatically
+    """
+    if os.path.exists(model_name_or_path):
+        return model_name_or_path
+    model_source = envs.FD_MODEL_SOURCE
+    local_path = envs.FD_MODEL_CACHE
+    repo_id = model_name_or_path
+    if model_source == "AISTUDIO":
+        try:
+            if repo_id.lower().strip().startswith("baidu"):
+                repo_id = "PaddlePaddle" + repo_id.strip()[5:]
+            if local_path is None:
+                local_path = f'{os.getenv("HOME")}'
+            local_path = f"{local_path}/{repo_id}"
+            aistudio_download(repo_id=repo_id, revision=revision, local_dir=local_path)
+            model_name_or_path = local_path
+        except requests.exceptions.ConnectTimeout:
+            if os.path.exists(local_path):
+                llm_logger.error(
+                    f"Failed to connect to aistudio, but detected that the model directory {local_path} exists. Attempting to start."
+                )
+                return local_path
+        except Exception:
+            raise Exception(
+                f"The {revision} of {model_name_or_path} is not exist. Please check the model name or revision."
+            )
+    elif model_source == "MODELSCOPE":
+        try:
+            from modelscope.hub.snapshot_download import (
+                snapshot_download as modelscope_download,
+            )
+
+            if repo_id.lower().strip().startswith("baidu"):
+                repo_id = "PaddlePaddle" + repo_id.strip()[5:]
+            if local_path is None:
+                local_path = f'{os.getenv("HOME")}'
+            local_path = f"{local_path}/{repo_id}"
+            modelscope_download(repo_id=repo_id, revision=revision, local_dir=local_path)
+            model_name_or_path = local_path
+        except requests.exceptions.ConnectTimeout:
+            if os.path.exists(local_path):
+                llm_logger.error(
+                    f"Failed to connect to modelscope, but detected that the model directory {local_path} exists. Attempting to start."
+                )
+                return local_path
+        except Exception:
+            raise Exception(
+                f"The {revision} of {model_name_or_path} is not exist. Please check the model name or revision."
+            )
+    elif model_source == "HUGGINGFACE":
+        try:
+            from huggingface_hub._snapshot_download import (
+                snapshot_download as huggingface_download,
+            )
+
+            if revision == "master":
+                revision = "main"
+            repo_id = model_name_or_path
+            if repo_id.lower().strip().startswith("PaddlePaddle"):
+                repo_id = "baidu" + repo_id.strip()[12:]
+            if local_path is None:
+                local_path = f'{os.getenv("HOME")}'
+            local_path = f"{local_path}/{repo_id}"
+            huggingface_download(repo_id=repo_id, revision=revision, local_dir=local_path)
+            model_name_or_path = local_path
+        except Exception:
+            raise Exception(
+                f"The {revision} of {model_name_or_path} is not exist. Please check the model name or revision."
+            )
+    else:
+        raise ValueError(
+            f"Unsupported model source: {model_source}, please choose one of ['MODELSCOPE', 'AISTUDIO', 'HUGGINGFACE']"
+        )
+    return model_name_or_path
+
+
+def get_hash_str(token_ids: List[int], extra_keys: Optional[Any] = []) -> str:
+    """
+    calculate hash value of a block with additional keys
+
+    Args:
+        token_ids: Input token IDs
+        extra_keys: Additional keys for block identification
+    """
+    value = (token_ids, extra_keys)
+    return hashlib.sha256(pickle.dumps(value)).hexdigest()
+
+
+def is_list_of(
+    value: object,
+    typ: Union[type[T], tuple[type[T], ...]],
+    *,
+    check: Literal["first", "all"] = "first",
+) -> TypeIs[list[T]]:
+    """
+    Check if the value is a list of specified type.
+
+    Args:
+        value: The value to check.
+        typ: The type or tuple of types to check against.
+        check: The check mode, either "first" or "all".
+
+    Returns:
+        Whether the value is a list of specified type.
+    """
+    if not isinstance(value, list):
+        return False
+
+    if check == "first":
+        return len(value) == 0 or isinstance(value[0], typ)
+    elif check == "all":
+        return all(isinstance(v, typ) for v in value)
+
+    assert_never(check)
+
+
+def import_from_path(module_name: str, file_path: Union[str, os.PathLike]):
+    """
+    Import a Python file according to its file path.
+    """
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if spec is None:
+        raise ModuleNotFoundError(f"No module named '{module_name}'")
+
+    assert spec.loader is not None
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def is_package_installed(package_name):
+    try:
+        distribution(package_name)
+        return True
+    except PackageNotFoundError:
+        return False
+
+
+def version():
+    """
+    Prints the contents of the version.txt file located in the parent directory of this script.
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    version_file_path = os.path.join(current_dir, "version.txt")
+
+    content = "Unknown"
+    try:
+        with open(version_file_path, "r") as f:
+            content = f.read()
+    except FileNotFoundError:
+        llm_logger.error("[version.txt] Not Found!")
+    return content
+
+
+def get_version_info():
+    """
+    Read version.txt file and parse version information, returning as a dict structure.
+
+    Returns:
+        dict: A dictionary containing version information, or None if the file does not exist
+        The dictionary contains the following keys:
+        - 'fastdeploy_commit': FastDeploy GIT COMMIT ID
+        - 'paddle_version': Paddle version
+        - 'paddle_commit': Paddle GIT COMMIT ID
+        - 'cuda_version': CUDA version
+        - 'cxx_version': CXX compiler version
+        - 'fastdeploy_version': fastdeploy version
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    version_file_path = os.path.join(current_dir, "version.txt")
+
+    try:
+        with open(version_file_path, "r") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return None
+
+    version_info = {}
+    try:
+        lines = content.strip().split("\n")
+        for line in lines:
+            if line.startswith("fastdeploy GIT COMMIT ID:"):
+                version_info["fastdeploy_commit"] = line.split("fastdeploy GIT COMMIT ID:")[1].strip()
+            elif line.startswith("Paddle version:"):
+                version_info["paddle_version"] = line.split("Paddle version:")[1].strip()
+            elif line.startswith("Paddle GIT COMMIT ID:"):
+                version_info["paddle_commit"] = line.split("Paddle GIT COMMIT ID:")[1].strip()
+            elif line.startswith("CUDA version:"):
+                version_info["cuda_version"] = line.split("CUDA version:")[1].strip()
+            elif line.startswith("CXX compiler version:"):
+                version_info["cxx_version"] = line.split("CXX compiler version:")[1].strip()
+            elif line.startswith("fastdeploy version:"):
+                version_info["fastdeploy_version"] = line.split("fastdeploy version:")[1].strip()
+    except Exception as e:
+        console_logger.error(f"Failed to parse version info from version.txt: {e}")
+        return None
+
+    return version_info if version_info else None
+
+
+def current_package_version():
+    """
+    Read version.txt file and parse the fastdeploy version number.
+
+    Args:
+    Returns:
+        str: fastdeploy version number, or "Unknown" if parsing fails
+    """
+    version_info = get_version_info()
+    if version_info is None:
+        return "Unknown"
+
+    return version_info.get("fastdeploy_version", "Unknown")
+
+
+class DeprecatedOptionWarning(argparse.Action):
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        console_logger.warning(f"Deprecated option is detected: {option_string}, which may be removed later")
+        setattr(namespace, self.dest, True)
+
+
+DEPRECATED_ARGS = ["enable_mm"]
+
+
+def deprecated_kwargs_warning(**kwargs):
+    for arg in DEPRECATED_ARGS:
+        if arg in kwargs:
+            console_logger.warning(f"Deprecated argument is detected: {arg}, which may be removed later")
+
+
+class StatefulSemaphore:
+    __slots__ = ("_semaphore", "_max_value", "_acquired_count", "_last_reset")
+
+    """
+    StatefulSemaphore is a class that wraps an asyncio.Semaphore and provides additional stateful information.
+    """
+
+    def __init__(self, value: int):
+        """
+        StatefulSemaphore constructor
+        """
+        if value < 0:
+            raise ValueError("Value must be non-negative.")
+        self._semaphore = asyncio.Semaphore(value)
+        self._max_value = value
+        self._acquired_count = 0
+        self._last_reset = time.monotonic()
+
+    async def acquire(self):
+        await self._semaphore.acquire()
+        self._acquired_count += 1
+
+    def release(self):
+        self._semaphore.release()
+
+        self._acquired_count = max(0, self._acquired_count - 1)
+
+    def locked(self) -> bool:
+        return self._semaphore.locked()
+
+    @property
+    def available(self) -> int:
+        return self._max_value - self._acquired_count
+
+    @property
+    def acquired(self) -> int:
+        return self._acquired_count
+
+    @property
+    def max_value(self) -> int:
+        return self._max_value
+
+    @property
+    def uptime(self) -> float:
+        return time.monotonic() - self._last_reset
+
+    def status(self) -> dict:
+        return {
+            "available": self.available,
+            "acquired": self.acquired,
+            "max_value": self.max_value,
+            "uptime": round(self.uptime, 2),
+        }
+
+
+def parse_quantization(value: Union[Dict, str]) -> Dict:
+    """
+    Parse a JSON string into a dictionary.
+    """
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        value = "null"
+    try:
+        return json.loads(value)
+    except ValueError:
+        return {"quantization": value}
+
+
+def check_download_links(bos_client, links, timeout=1):
+    """
+    check bos download links
+    """
+    for link in links:
+        try:
+            if link.startswith("bos://"):
+                link = link.replace("bos://", "")
+
+            bucket_name = "/".join(link.split("/")[1:-1])
+            object_key = link.split("/")[-1]
+            response = bos_client.get_object_meta_data(bucket_name, object_key)
+            assert (
+                int(response.metadata.content_length) > 0
+            ), f"bos download length error, {response.metadata.content_length}"
+        except Exception as e:
+            return f"link {link} download error: {str(e)}"
+    return None
+
+
+def init_bos_client():
+    from baidubce.auth.bce_credentials import BceCredentials
+    from baidubce.bce_client_configuration import BceClientConfiguration
+    from baidubce.services.bos.bos_client import BosClient
+
+    cfg = BceClientConfiguration(
+        credentials=BceCredentials(envs.ENCODE_FEATURE_BOS_AK, envs.ENCODE_FEATURE_BOS_SK),
+        endpoint=envs.ENCODE_FEATURE_ENDPOINT,
+    )
+
+    try:
+        client = BosClient(cfg)
+        client.list_buckets()
+    except Exception as e:
+        raise Exception(
+            "Create BOSClient Error, Please check your ENV [ ENCODE_FEATURE_BOS_AK, ENCODE_FEATURE_BOS_SK, ENCODE_FEATURE_ENDPOINT ] \n"
+            f"Current ENV AK: {envs.ENCODE_FEATURE_BOS_AK}, SK: {envs.ENCODE_FEATURE_BOS_SK}, Endpoint: {envs.ENCODE_FEATURE_ENDPOINT} \n"
+            f"{str(e)}"
+        )
+    return client
+
+
+def download_from_bos(bos_client, bos_links, retry: int = 0):
+    """
+    Download pickled objects from Baidu Object Storage (BOS).
+    Args:
+        bos_client: BOS client instance
+        bos_links: Single link or list of BOS links in format "bos://bucket-name/path/to/object"
+        retry: Number of times to retry on failure (only retries on network-related errors)
+    Yields:
+        tuple: (success: bool, data: np.ndarray | error_msg: str)
+            - On success: (True, deserialized_data)
+            - On failure: (False, error_message) and stops processing remaining links
+    Security Note:
+        Uses pickle deserialization. Only use with trusted data sources.
+    """
+
+    def _bos_download(bos_client, link):
+        try:
+            if isinstance(link, list) and len(link) > 0:
+                link = link[0]
+            if link.startswith("bos://"):
+                link = link.replace("bos://", "")
+        except Exception as e:
+            raise Exception(f"Bos Download link Error, Please check your links: {link} \n" f"{str(e)}")
+        bucket_name = "/".join(link.split("/")[1:-1])
+        object_key = link.split("/")[-1]
+        return bos_client.get_object_as_string(bucket_name, object_key)
+
+    if not isinstance(bos_links, list):
+        bos_links = [bos_links]
+
+    for link in bos_links:
+        try:
+            response = _bos_download(bos_client, link)
+            yield True, pickle.loads(response)
+        except Exception:
+            # Only retry on network-related or timeout exceptions
+            exceptions_msg = str(traceback.format_exc())
+
+            if "request rate is too high" not in exceptions_msg or retry <= 0:
+                yield False, f"Failed to download {link}: {exceptions_msg}"
+                break
+
+            for attempt in range(retry):
+                try:
+                    llm_logger.warning(f"Retry attempt {attempt + 1}/{retry} for {link}")
+                    response = _bos_download(bos_client, link)
+                    yield True, pickle.loads(response)
+                    break
+                except Exception:
+                    if attempt == retry - 1:  # Last attempt failed
+                        yield False, f"Failed after {retry} retries for {link}: {str(traceback.format_exc())}"
+            break
+
+
+def parse_type(return_type: Callable[[str], T]) -> Callable[[str], T]:
+
+    def _parse_type(val: str) -> T:
+        try:
+            return return_type(val)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(f"Value {val} cannot be converted to {return_type}.") from e
+
+    return _parse_type
+
+
+def optional_type(return_type: Callable[[str], T]) -> Callable[[str], Optional[T]]:
+
+    def _optional_type(val: str) -> Optional[T]:
+        if val == "" or val == "None":
+            return None
+        return parse_type(return_type)(val)
+
+    return _optional_type
+
+
+def clamp_prompt_logprobs(
+    prompt_logprobs: PromptLogprobs | None,
+) -> PromptLogprobs | None:
+    if prompt_logprobs is None:
+        return prompt_logprobs
+
+    for logprob_dict in prompt_logprobs:
+        if logprob_dict is None:
+            continue
+        for logprob_values in logprob_dict.values():
+            if logprob_values.logprob == float("-inf"):
+                logprob_values.logprob = -9999.0
+    return prompt_logprobs
+
+
+def to_numpy(tasks: List[Any]):
+    """
+    Convert PaddlePaddle tensors in multimodal inputs to NumPy arrays.
+
+    Args:
+        tasks: List of tasks containing multimodal inputs.
+    """
+    try:
+        for task in tasks:
+            if not hasattr(task, "multimodal_inputs"):
+                continue
+            images = task.multimodal_inputs.get("images", None)
+            if isinstance(images, paddle.Tensor):
+                llm_logger.debug(f"Convert image to numpy, shape: {images.shape}")
+                task.multimodal_inputs["images"] = images.numpy()
+
+            list_keys = [
+                "image_features",
+                "video_features",
+                "audio_features",
+            ]
+            for key in list_keys:
+                value = task.multimodal_inputs.get(key, None)
+                if value is None:
+                    continue
+                if isinstance(value, list):
+                    task.multimodal_inputs[key] = [v.numpy() for v in value]
+    except Exception as e:
+        llm_logger.warning(f"Failed to convert to numpy: {e}")
+
+
+def to_tensor(tasks: List[Any]):
+    """
+    Convert NumPy arrays in multimodal inputs to Paddle tensors.
+
+    Args:
+        tasks (tuple): ([request], bsz)
+    """
+    try:
+        for task in tasks:
+            multimodal_inputs = getattr(task, "multimodal_inputs", None)
+            if not multimodal_inputs:
+                continue
+            # tensor keys
+            tensor_keys = [
+                "images",
+                "patch_idx",
+                "token_type_ids",
+                "position_ids",
+                "attention_mask_offset",
+            ]
+
+            list_keys = [
+                "image_features",
+                "video_features",
+                "audio_features",
+            ]
+
+            llm_logger.debug(f"Converting multimodal inputs to tensor...{tensor_keys + list_keys}")
+
+            for key in tensor_keys:
+                value = multimodal_inputs.get(key)
+                if value is None:
+                    continue
+                if not isinstance(value, paddle.Tensor):
+                    multimodal_inputs[key] = paddle.to_tensor(value)
+
+            for key in list_keys:
+                value = multimodal_inputs.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, list):
+                    multimodal_inputs[key] = [paddle.to_tensor(v) for v in value]
+    except Exception as e:
+        llm_logger.warning(f"Tensor conversion failed: {type(e).__name__}: {e}")
+
+
+def fill_paddle_tensor(shared_inputs_object, key, value):
+    """
+    Fill a paddle tensor with the given value.
+
+    Args:
+        shared_inputs_object: Either an object with attributes or a dictionary
+        key: The key/attribute name to access
+        value: The value to fill the tensor with
+    """
+    try:
+        # Handle both dictionary-style and object-style access
+        if hasattr(shared_inputs_object, key):
+            attr = getattr(shared_inputs_object, key)
+        elif hasattr(shared_inputs_object, "__getitem__") and key in shared_inputs_object:
+            attr = shared_inputs_object[key]
+        else:
+            return
+
+        if isinstance(attr, paddle.Tensor):
+            attr.fill_(value)
+    except Exception as e:
+        llm_logger.warning(f"Failed to fill key {key} with value {value}: {e}")
+
+
+def do_nothing(*args, **kwargs):
+    def decorator(func):
+        return func
+
+    return decorator
+
+
+@cache
+def _is_package_installed(dist_name: str) -> bool:
+    try:
+        distribution(dist_name)
+        return True
+    except PackageNotFoundError:
+        return False
+
+
+if hasattr(paddle.static, "register_op"):
+    from paddle.static import register_op
+else:
+    register_op = do_nothing
+
+register_custom_python_op = register_op
+
+
+def all_gather_values(value: int | float | bool, group: paddle.distributed.communication.group.Group) -> list:
+    _type = type(value)
+    _local = paddle.to_tensor([value], dtype="float32")
+    _global = [paddle.zeros_like(_local) for _ in range(group.world_size)]
+    paddle.distributed.all_gather(_global, _local, group)
+    _results = [_type(t.item()) for t in _global]
+    return _results
+
+
+# =============================================================================
+# Logger re-export (backward compatibility)
+# Actual implementation is in fastdeploy.logger module, re-exported here to
+# support existing import patterns
+# NOTE: Must be at the end of file to avoid circular imports
+# =============================================================================
+from fastdeploy.logger import (  # noqa: F401
+    api_server_logger,
+    console_logger,
+    data_processor_logger,
+    fmq_logger,
+    get_logger,
+    llm_logger,
+    obj_logger,
+    register_manager_logger,
+    router_logger,
+    scheduler_logger,
+    spec_logger,
+    trace_logger,
+)

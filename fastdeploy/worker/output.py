@@ -14,81 +14,362 @@
 # limitations under the License.
 """
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import NamedTuple, Optional
 
 import paddle
 
 
 @dataclass
-class PreProcessOutputData:
+class Logprob:
+    """
+    A named tuple containing information about a token's log probability.
+    """
+
+    logprob: float
+    rank: Optional[int] = None
+    decoded_token: Optional[str] = None
+
+
+# [{token_id, logprob}] for tokens sampled from the top-k
+SampleLogprobs = list[dict[int, Logprob]]
+
+
+class LogprobsLists(NamedTuple):
     """ """
+
+    # [num_reqs, max_num_logprobs + 1]
+    logprob_token_ids: list[list[int]]
+    # [num_reqs, max_num_logprobs + 1]
+    logprobs: list[list[float]]
+    # [num_reqs]
+    sampled_token_ranks: list[int]
+
+    def slice_columns(self, start: int, end: int):
+        """
+        Slice columns (per-row top-k logprobs and token IDs).
+        Keeps the number of requests unchanged.
+        """
+        return LogprobsLists(
+            [row[start:end] for row in self.logprob_token_ids],
+            [row[start:end] for row in self.logprobs],
+            self.sampled_token_ranks,  # unchanged
+        )
+
+    def slice_rows(self, start: int, end: int):
+        """
+        Slice rows.
+        Keeps the number of max_num_logprobs unchanged.
+        """
+        return LogprobsLists(
+            self.logprob_token_ids[start:end],
+            self.logprobs[start:end],
+            self.sampled_token_ranks[start:end],
+        )
+
+
+class LogprobsTensors(NamedTuple):
+    """ """
+
+    # [num_reqs, max_num_logprobs + 1]
+    logprob_token_ids: paddle.Tensor
+    # [num_reqs, max_num_logprobs + 1]
+    logprobs: paddle.Tensor
+    # [num_reqs]
+    selected_token_ranks: paddle.Tensor
+
+    def tolists(self):
+        """Convert to lists."""
+        return LogprobsLists(
+            self.logprob_token_ids.tolist(),
+            self.logprobs.tolist(),
+            self.selected_token_ranks.tolist(),
+        )
+
+    @staticmethod
+    def empty_cpu(num_positions: int, num_tokens_per_position: int) -> "LogprobsTensors":
+        """Create empty LogprobsTensors on CPU."""
+
+        logprob_token_ids = paddle.empty([num_positions, num_tokens_per_position], device="cpu", dtype=paddle.int64)
+        logprobs = paddle.empty_like(logprob_token_ids, device="cpu", dtype=paddle.float32)
+        selected_token_ranks = paddle.empty([num_positions], device="cpu", dtype=paddle.int64)
+        return LogprobsTensors(
+            logprob_token_ids=logprob_token_ids,
+            logprobs=logprobs,
+            selected_token_ranks=selected_token_ranks,
+        )
+
+    @staticmethod
+    def empty(num_positions: int, num_tokens_per_position: int) -> "LogprobsTensors":
+        """Create empty LogprobsTensors on default device."""
+
+        logprob_token_ids = paddle.empty([num_positions, num_tokens_per_position], dtype=paddle.int64)
+        logprobs = paddle.empty_like(logprob_token_ids, dtype=paddle.float32)
+        selected_token_ranks = paddle.empty([num_positions], dtype=paddle.int64)
+        return LogprobsTensors(
+            logprob_token_ids=logprob_token_ids,
+            logprobs=logprobs,
+            selected_token_ranks=selected_token_ranks,
+        )
+
+    def slice_rows(self, start: int, end: int):
+        """
+        Slice rows.
+        Keeps the number of max_num_logprobs unchanged.
+        """
+        with paddle.no_grad():
+            return LogprobsTensors(
+                paddle.to_tensor(self.logprob_token_ids.cpu()[start:end], place="cpu"),
+                paddle.to_tensor(self.logprobs.cpu()[start:end], place="cpu"),
+                paddle.to_tensor(self.selected_token_ranks.cpu()[start:end], place="cpu"),
+            )
+
+
+PromptLogprobs = LogprobsTensors | list[dict[int, Logprob] | None]
+
+
+@dataclass
+class SpeculateMetrics:
+    """
+    Speculative decoding metrics
+    """
+
+    """
+    The number of accepted tokens in the current request
+    """
+    accepted_tokens: int
+
+    """
+    The number of rejected tokens in the current request
+    """
+    rejected_tokens: int
+
+    """
+    The acceptance rate of the current request
+    """
+    accept_ratio: float
+
+    """
+    Average number of accepted tokens per step for the current request
+    """
+    average_accept_length: float
+
+    """
+    The number of accepted tokens of each head in the current request
+    """
+    accepted_tokens_per_head: list[int]
+
+    """
+    Average acceptance rate of each head in the current request
+    """
+    accept_ratio_per_head: list[float]
+
+
+@dataclass
+class SamplerOutput:
+    """ """
+
+    # [num_reqs, max_num_generated_tokens]
+    # Different requests can have different number of generated tokens.
+    # All requests are padded to max_num_generated_tokens.
+    # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
+    sampled_token_ids: paddle.Tensor
+    logprobs_tensors: Optional[LogprobsTensors]
+    token_num_per_batch: Optional[paddle.Tensor] = None
+    cu_batch_token_offset: Optional[paddle.Tensor] = None
+    logits: Optional[paddle.Tensor] = None
 
 
 @dataclass
 class ModelOutputData:
-    """ """
-    # Tokens generated in the previous step
+    """
+    OutputData by execute_model
+    """
+
+    """
+        Tokens generated in the previous step
+    """
     next_tokens: paddle.Tensor
 
-    # Flags indicating whether decoding should stop
+    """
+        Flags indicating whether decoding should stop
+    """
     stop_flags: paddle.Tensor
 
-    # Index of the current decoding step
+    """
+        Index of the current decoding step
+    """
     step_idx: int
 
-    # Maximum decoding length
+    """
+        Maximum decoding length
+    """
     max_dec_len: int
 
-    # Previous ids used for decoding
-    pre_ids: paddle.Tensor
-
-    # Sequence lengths for this step
+    """
+        Sequence lengths for this step
+    """
     seq_lens_this_time: paddle.Tensor
 
-    #  Lengths of the stop sequences
-    stop_seqs_len: paddle.Tensor
+    """
+        Eos token ID
+    """
+    eos_token_id: paddle.Tensor
 
-    #  Indicates if stopping conditions should be ignored
+    """
+        Indicates if stopping conditions should be ignored
+    """
     not_need_stop: bool
 
-    # Sequence lengths of the encoder
+    """
+        Sequence lengths of the encoder
+    """
     seq_lens_encoder: paddle.Tensor
 
-    # Sequence lengths of the decoder
+    """
+        Sequence lengths of the decoder
+    """
     seq_lens_decoder: paddle.Tensor
 
-    # Indicates if this is a blocking step
+    """
+        Indicates if this is a blocking step
+    """
     is_block_step: bool
 
-    # Use message queue output
-    output_via_mq: bool
-
-    # The ID of the message queue.
+    """
+        The ID of the message queue.
+    """
     msg_queue_id: int
 
-    # The model parallel rank
+    """
+        The model parallel rank
+    """
     mp_rank: int
 
-    # Use EP parallel
+    """
+        Use EP parallel
+    """
     use_ep: bool
+
+    """
+        input ids
+    """
+    input_ids: paddle.Tensor
+
+    """
+        for speculative decoding
+        full hidden states before lm_head
+    """
+    full_hidden_states: paddle.Tensor
+
+    """
+         draft tokens for every sequence
+    """
+    draft_tokens: paddle.Tensor
+
+    """
+        draft token num for every sequence
+    """
+    actual_draft_token_num: paddle.Tensor
+
+    """
+        accepted tokens in current step
+    """
+    accept_tokens: paddle.Tensor
+
+    """
+        the number of accepted tokens in current step
+    """
+    accept_num: paddle.Tensor
+
+    """
+        Tokens including prompts and generated tokens
+    """
+    token_ids_all: Optional[paddle.Tensor] = None
+
+    """
+        Previous generated tokens
+    """
+    pre_ids: Optional[paddle.Tensor] = None
+
+    """
+        the token ids of stop sequence
+    """
+    stop_token_ids: paddle.Tensor = None
+
+    """
+        the length of stop sequence
+    """
+    stop_seqs_len: paddle.Tensor = None
+
+    """
+        the length of input prompt
+    """
+    prompt_lens: paddle.Tensor = None
+
+    """
+        step mask rollback in some cases
+    """
+    mask_rollback: paddle.Tensor = None
+
+    """
+        prompt_logprobs
+    """
+    prompt_logprobs_list: Optional[LogprobsTensors] = None
+
+    """
+        index -> request_id
+    """
+    index_to_batch_id: dict[int, int] = field(default_factory=dict)
+
+    """
+        the minimum tokens that will be generated
+    """
+    min_tokens: paddle.Tensor = None
+
+    """
+        enable_pd_reorder
+    """
+    enable_pd_reorder: bool = False
+
+    """
+        stop nums for every sequence
+    """
+    stop_nums: paddle.Tensor = None
+
+    """
+        Device version of not_need_stop flag for async operations
+    """
+    not_need_stop_device: paddle.Tensor = None
 
 
 @dataclass
 class ModelRunnerOutput:
     """
-        [WIP] ModelRunnerOutput is serialized and sent to the scheduler process.
+    [WIP] ModelRunnerOutput is serialized and sent to the scheduler process.
     """
-    # [num_reqs]
+
+    """
+        [num_reqs]
+    """
     req_ids: list[str]
 
-    # req_id -> index
+    """
+        req_id -> index
+    """
     req_id_to_index: dict[str, int]
 
-    # [num_reqs, num_generated_tokens]
+    """
+        [num_reqs, num_generated_tokens]
+    """
     sampled_token_ids: list[list[int]]
 
-    # [num_reqs, num_spec_tokens]
+    """
+        [num_reqs, num_spec_tokens]
+    """
     spec_token_ids: Optional[list[list[int]]]
 
-    # TODO(gongshaotian): supplement other outputs info
+    """
+    [num_reqs, hidden_size]
+    """
+    pooler_output: list[Optional[paddle.Tensor]]

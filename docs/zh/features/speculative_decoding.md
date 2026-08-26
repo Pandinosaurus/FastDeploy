@@ -1,0 +1,210 @@
+[English](../../features/speculative_decoding.md)
+
+# 🔮 投机解码
+本项目基于 PaddlePaddle 实现了高效的 **投机解码（Speculative Decoding）** 推理框架，支持多 Token 预测（Multi-token Proposing, MTP），用于加速大语言模型（LLM）的生成，显著降低时延并提升吞吐量。
+
+## ✅ 投机解码方法支持
+### ✅ 支持列表
+
+- **Naive**: 普通解码模式，走投机解码代码路径但不生成草稿Token，用于测试投机解码框架的正确性
+
+- **Ngram**: 基于n-gram匹配的投机解码方法
+
+- **后缀解码**
+
+- **MTP (Multi-Token Prediction)**
+  - ✅ 已支持：TP 切分
+  - ✅ 已支持：共享前缀
+  - ✅ 已支持：单机 TP 切分 + PD 分离
+  - ⏳ 即将支持：EP + DP + PD 分离
+  - ⏳ 即将支持：兼容 Chunk Prefill
+  - ⏳ 即将支持：多层 MTP layer
+
+- **混合MTP、Ngram方法解码(Hybrid-MTP-with-Ngram)**
+  - 方法概述：混合MTP与Ngram方法，先使用MTP产出N个草稿Token，再使用Ngram匹配补充草稿Token。
+  - 使用场景：适合在需要更多草稿Token时使用，兼顾MTP生成能力与Ngram匹配的高效性。
+---
+
+### ⏳ 规划中
+
+- Draft Model
+- Eagle
+- Hydra
+- Medusa
+- ...
+
+## ⚙️ 高效投机解码框架设计
+- **Attention机制**：采用 [Cascade Append Attention](https://flashinfer.ai/2024/02/02/cascade-inference.html) 的 Attention 机制，支持变长查询统一处理，一次前向推理即可完成所有验证。此外，我们对 Kernel 实现进行了深度定制，以最大化 Tensor Core 的利用率，并在高并发场景下仍然保持高吞吐。
+- **虚拟填充机制**：采用虚拟填充快速定位输出 Token 的批次 ID，避免了高开销的数据拷贝与切片操作。
+- **并行采样与验证**：我们开发了多个融合 Cuda Kernel，用于同时执行采样与验证操作。该 Kernel 支持对每个 batch 样本进行并行处理，避免了显式循环的开销。
+- **高效 DraftModel/MTP 框架**：开发多个融合 Cuda Kernel，统一完成模型类方法的前后处理，相比传统的循环、切片方法，性能高效且易维护
+
+## 🔧 参数说明
+
+### 基础参数
+- `method`: 解码策略，可选值为 `"mtp"`、`"ngram"`、`"naive"` 或 `"suffix"`
+  - `naive`: 普通解码模式，走投机解码代码路径但不生成草稿Token
+  - `ngram`: 基于n-gram匹配的投机解码
+  - `mtp`: 多Token预测（Multi-Token Prediction）
+  - `suffix`: 基于后缀解码的投机解码
+- `num_speculative_tokens`: 每轮预测的 Token 数，最大支持 5（当前 MTP 仅支持 1）
+- `num_model_steps`: MTP 模型步数，需满足 `num_speculative_tokens >= num_model_steps`
+- `model`: 若选择 MTP，则需指定 MTP 模型路径
+- `quantization`: 模型量化方式，推荐使用 `wint8`
+- `batch_size`: 当前支持最大值为 256
+
+### 验证策略参数 (verify_strategy)
+控制草稿Token的验证方式：
+- `topp` (默认): Top-P采样验证，草稿Token需在Top-P候选集中
+- `greedy`: 贪婪验证，草稿Token需等于目标模型的argmax输出
+- `target_match`: 目标匹配验证，草稿Token需等于目标模型的采样输出
+
+```bash
+--speculative-config '{"method": "mtp", "verify_strategy": "greedy", "num_speculative_tokens": 1, "model": "${path_to_mtp_model}"}'
+```
+
+### 接受策略参数 (accept_policy)
+控制草稿Token的接受行为：
+- `normal` (默认): 正常验证流程
+- `accept_all`: 接受所有草稿Token（调试用）
+- `reject_all`: 拒绝所有草稿Token（调试用）
+
+```bash
+--speculative-config '{"method": "mtp", "accept_policy": "accept_all", "num_speculative_tokens": 1}'
+```
+
+## 🚀 使用 Multi-Token-Prediction(MTP) 解码
+详见论文：[DeepSeek-V3](https://arxiv.org/pdf/2412.19437)
+### TP 并行部署
+> 使用 4×H100，量化方式选择 WINT4
+> 配置文件：`benchmarks/yaml/eb45t-32k-wint4-mtp-h100-tp4.yaml`
+
+```
+python -m fastdeploy.entrypoints.openai.api_server \
+    --model ${path_to_main_model} \
+    --tensor-parallel-size 4 \
+    --config ${path_to_FastDeploy}benchmarks/yaml/eb45t-32k-wint4-mtp-h100-tp4.yaml \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 1, "model": "${path_to_mtp_model}"}'
+```
+
+### PD 分离式部署（1P1D）
+> 在8×H100上部署1P1D，P、D节点 分别使用 4×H100；量化方式选择 WINT4
+> 与常规 PD 分离部署一致，仅需替换配置文件并新增 speculative_config
+详情请参考[PD分离式部署](./disaggregated.md)。
+- P 节点（Prefill）
+
+> 配置文件： `benchmarks/yaml/eb45t-32k-wint4-mtp-tp4-prefill.yaml`
+
+```
+export FD_LOG_DIR="log_prefill"
+rm -rf ${FD_LOG_DIR}
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+python -m fastdeploy.entrypoints.openai.api_server  \
+       --model ${path_to_main_model} \
+       --port 8180 \
+       --metrics-port 8181 \
+       --engine-worker-queue-port 8182 \
+       --cache-queue-port 8183 \
+       --workers 2 \
+       --tensor-parallel-size 4 \
+       --quantization wint4 \
+       --splitwise-role "prefill" \
+       --scheduler-name "splitwise" \
+       --scheduler-host "127.0.0.1" \
+       --scheduler-port 6379 \
+       --scheduler-ttl 9000 \
+       --scheduler-topic mtp \
+       --config ${path_to_FastDeploy}/benchmarks/yaml/eb45t-32k-wint4-mtp-tp4-prefill.yaml \
+       --scheduler-password "scheduler_mtp" \
+       --speculative-config '{"method": "mtp", "num_speculative_tokens": 1, "model": ""${path_to_mtp_model}"}'  &
+```
+
+- D 节点（Decode）
+
+> 配置文件： `benchmarks/yaml/eb45t-32k-wint4-mtp-tp4-decode.yaml`
+
+```
+export FD_LOG_DIR="log_prefill"
+rm -rf ${FD_LOG_DIR}
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+python -m fastdeploy.entrypoints.openai.api_server  \
+       --model ${path_to_main_model} \
+       --port 8180 \
+       --metrics-port 8181 \
+       --engine-worker-queue-port 8182 \
+       --cache-queue-port 8183 \
+       --workers 2 \
+       --tensor-parallel-size 4 \
+       --quantization wint4 \
+       --splitwise-role "prefill" \
+       --scheduler-name "splitwise" \
+       --scheduler-host "127.0.0.1" \
+       --scheduler-port 6379 \
+       --scheduler-ttl 9000 \
+       --scheduler-topic mtp \
+       --config ${path_to_FastDeploy}/benchmarks/yaml/eb45t-32k-wint4-mtp-tp4-prefill.yaml \
+       --scheduler-password "scheduler_mtp" \
+       --speculative-config '{"method": "mtp", "num_speculative_tokens": 1, "model": ""${path_to_mtp_model}"}'  &
+```
+## 使用混合MTP、Ngram方法解码
+在启动服务时，只需改动 --speculative-config 即可。例如使用MTP产出两个DraftToken，再额外拼接三个Ngram匹配的DraftToken
+```
+--speculative-config '{"method": "mtp", "num_model_steps": 2, "mtp_strategy": "with_ngram" ,"num_speculative_tokens": 5, "model": "'$model_path'/mtp"}'
+
+```
+## 🧠 使用 Ngram 解码
+该算法通过 n-gram 窗口从 prompt 和已生成的 Token 中进行匹配生成草稿 Token，适合输入和输出有很大 overlap 的场景，如代码续写、文档查询等。
+> 使用 4×H100；量化方式选择 WINT4
+> 配置文件：benchmarks/yaml/eb45t-32k-wint4-mtp-h100-tp4.yaml
+
+```
+python -m fastdeploy.entrypoints.openai.api_server \
+    --model ${path_to_main_model} \
+    --tensor-parallel-size 4 \
+    --config ${path_to_FastDeploy}benchmarks/yaml/eb45t-32k-wint4-mtp-h100-tp4.yaml \
+    --speculative-config '{"method": "ngram", "num_speculative_tokens": 1}'
+```
+
+## 📝 使用 Naive 模式（普通解码）
+Naive 模式走投机解码代码路径但不生成草稿 Token，用于测试投机解码框架的正确性或对比性能基线。
+
+```
+python -m fastdeploy.entrypoints.openai.api_server \
+    --model ${path_to_main_model} \
+    --tensor-parallel-size 4 \
+    --speculative-config '{"method": "naive"}'
+```
+
+**注意**: Naive 模式下 `num_speculative_tokens` 会被强制设置为 0。
+
+## 🌲 使用后缀解码 (Suffix Decoding)
+
+后缀解码是一种无模型推理框架，通过在 CPU 上使用高效后缀树进行快速草稿 Token 预测，加速重复性推理任务（如代理工作流程、编码等），消除 GPU 开销。
+
+使用 4×H100；量化方式选择 WINT4:
+
+> 配置文件：benchmarks/yaml/eb45t-32k-wint4-mtp-h100-tp4.yaml
+
+```
+python -m fastdeploy.entrypoints.openai.api_server \
+    --model ${path_to_main_model} \
+    --tensor-parallel-size 4 \
+    --config ${path_to_FastDeploy}benchmarks/yaml/eb45t-32k-wint4-mtp-h100-tp4.yaml \
+    --speculative-config '{"method": "suffix", "num_speculative_tokens": 4, "suffix_decoding_max_tree_depth": 64, "suffix_decoding_max_cached_requests": 10000, "suffix_decoding_max_spec_factor": 1.0, "suffix_decoding_min_token_prob": 0.1}'
+```
+
+参数描述
+
+```
+# 后缀树中缓存的token序列的最大长度
+self.suffix_decoding_max_tree_depth: int = 64
+
+# 缓存中可存储的请求数量上限
+self.suffix_decoding_max_cached_requests: int = -1
+
+# 匹配长度的系数，计算方式为 num_draft_tokens = suffix_max_spec_factor * matched_length
+self.suffix_decoding_max_spec_factor: float = 1.0
+
+# 推测token的概率阈值
+self.suffix_decoding_min_token_prob: float = 0.1
+```

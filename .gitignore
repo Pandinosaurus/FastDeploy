@@ -2,6 +2,13 @@
 /.venv/
 /venv/
 
+tests/log_*
+benchmarks/openai-chat-infqps*
+splitwise/log*
+
+# Prebuilt golang router binary (downloaded at build time)
+fastdeploy/golang_router/fd-router
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -136,6 +143,7 @@ kernel_meta*
 fastdeploy_ops.py
 version.txt
 EGG-INFO/
+**/fastdeploy_ops/__init__.py
 
 # fp8 generated codes
 autogen/
@@ -156,5 +164,24 @@ nohup.out
 custom_ops/gpu_ops/fp8_deep_gemm/deep_gemm/include/cutlass
 custom_ops/gpu_ops/fp8_deep_gemm/deep_gemm/include/cute
 
+#marlin_kernel
+custom_ops/gpu_ops/moe/moe_wna16_marlin_utils/kernel_*.cu
+
+#machete_kernel
+custom_ops/gpu_ops/machete/generated
+
 # buff
 custom_ops/tmp*
+
+build
+
+.ccls-cache
+.claude/settings.local.json
+
+third_party
+
+custom_ops/gpu_ops/w4afp8_gemm/w4afp8_gemm_*.cu
+custom_ops/gpu_ops/w4afp8_gemm/w4afp8_gemm_template.h
+
+custom_ops/gpu_ops/wfp8afp8_sparse_gemm/wfp8Afp8_sparse_gemm_*.cu
+custom_ops/gpu_ops/wfp8afp8_sparse_gemm/wfp8Afp8_sparse_gemm_template.h

@@ -25,11 +25,13 @@ struct AppendAttnMetaData {
   int kv_num_heads;
   int token_nums;
   int head_dims;
+  int head_dims_v;
   int max_blocks_per_seq;
+  const int* mask_offset = nullptr;
 };
 
 __forceinline__ __host__ __device__ int div_up(int a, int b) {
-  return (a + b - 1) / b;
+  return a / b + (a % b != 0);
 }
 
 enum PosEncMode { kNonePos, kRoPE, kAliBi };
@@ -108,29 +110,33 @@ __device__ __forceinline__ uint32_t sub_if_greater_or_zero(uint32_t x,
 
 /******************************FASTER CAST*********************************/
 
-inline __device__ static void convert_fp8(__nv_bfloat16* result, const uint32_t& source) {
-
+inline __device__ static void convert_fp8(__nv_bfloat16* result,
+                                          const uint32_t& source) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
-    uint32_t dest0;
-    uint32_t dest1;
-    asm volatile( \
-        "{\n" \
-        ".reg .b16 lo, hi;\n" \
-        "mov.b32 {lo, hi}, %2;\n" \
-        "cvt.rn.f16x2.e4m3x2 %0, lo;\n" \
-        "cvt.rn.f16x2.e4m3x2 %1, hi;\n" \
-        "}\n" : "=r"(dest0), "=r"(dest1) : "r"(source));
+  uint32_t dest0;
+  uint32_t dest1;
+  asm volatile(
+      "{\n"
+      ".reg .b16 lo, hi;\n"
+      "mov.b32 {lo, hi}, %2;\n"
+      "cvt.rn.f16x2.e4m3x2 %0, lo;\n"
+      "cvt.rn.f16x2.e4m3x2 %1, hi;\n"
+      "}\n"
+      : "=r"(dest0), "=r"(dest1)
+      : "r"(source));
 
-    ((nv_bfloat162*)(result))[0] = __float22bfloat162_rn(__half22float2(((half2*)(&dest0))[0]));
-    ((nv_bfloat162*)(result))[1] = __float22bfloat162_rn(__half22float2(((half2*)(&dest1))[0]));
+  ((nv_bfloat162*)(result))[0] =
+      __float22bfloat162_rn(__half22float2(((half2*)(&dest0))[0]));
+  ((nv_bfloat162*)(result))[1] =
+      __float22bfloat162_rn(__half22float2(((half2*)(&dest1))[0]));
 #else
-    printf("Do not support fp8 in arch < 890\n");
-    asm("trap;");
+  printf("Do not support fp8 in arch < 890\n");
+  asm("trap;");
 #endif
-
 }
 
-inline __device__ static void convert_fp8(half* result, const uint32_t& source) {
+inline __device__ static void convert_fp8(half* result,
+                                          const uint32_t& source) {
   printf("Do not support fp8 to half although it's very easy.\n");
 }
 
@@ -299,8 +305,18 @@ __forceinline__ __host__ __device__ void vec_cast<nv_bfloat16, float>(
 
 #define DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, ...) \
   switch (head_dim) {                              \
+    case 64: {                                     \
+      constexpr size_t HEAD_DIM = 64;              \
+      __VA_ARGS__                                  \
+      break;                                       \
+    }                                              \
     case 128: {                                    \
       constexpr size_t HEAD_DIM = 128;             \
+      __VA_ARGS__                                  \
+      break;                                       \
+    }                                              \
+    case 192: {                                    \
+      constexpr size_t HEAD_DIM = 192;             \
       __VA_ARGS__                                  \
       break;                                       \
     }                                              \
@@ -309,10 +325,56 @@ __forceinline__ __host__ __device__ void vec_cast<nv_bfloat16, float>(
     }                                              \
   }
 
-#define DISPATCH_NUM_STAGE(num_stage, NUM_STAGE, ...) \
-  if (num_stage == 2) {                               \
-    constexpr size_t NUM_STAGE = 2;                   \
-    __VA_ARGS__                                       \
+#define DISPATCH_GQA_HEAD_DIM(head_dim, HEAD_DIM, ...)  \
+  switch (head_dim) {                                   \
+    case 128: {                                         \
+      constexpr size_t HEAD_DIM = 128;                  \
+      __VA_ARGS__                                       \
+      break;                                            \
+    }                                                   \
+    case 192: {                                         \
+      constexpr size_t HEAD_DIM = 192;                  \
+      __VA_ARGS__                                       \
+      break;                                            \
+    }                                                   \
+    default: {                                          \
+      PD_THROW("not support the head_dim: ", head_dim); \
+    }                                                   \
+  }
+
+#define DISPATCH_MLA_HEAD_DIM(head_dim, HEAD_DIM, ...)  \
+  switch (head_dim) {                                   \
+    case 128: {                                         \
+      constexpr size_t HEAD_DIM = 128;                  \
+      __VA_ARGS__                                       \
+      break;                                            \
+    }                                                   \
+    case 192: {                                         \
+      constexpr size_t HEAD_DIM = 192;                  \
+      __VA_ARGS__                                       \
+      break;                                            \
+    }                                                   \
+    case 512: {                                         \
+      constexpr size_t HEAD_DIM = 512;                  \
+      __VA_ARGS__                                       \
+      break;                                            \
+    }                                                   \
+    case 576: {                                         \
+      constexpr size_t HEAD_DIM = 576;                  \
+      __VA_ARGS__                                       \
+      break;                                            \
+    }                                                   \
+    default: {                                          \
+      PD_THROW("not support the head_dim: ", head_dim); \
+    }                                                   \
+  }
+
+#define DISPATCH_NUM_STAGE(num_stage, NUM_STAGE, ...)   \
+  if (num_stage == 2) {                                 \
+    constexpr size_t NUM_STAGE = 2;                     \
+    __VA_ARGS__                                         \
+  } else {                                              \
+    PD_THROW("not support the num_stage: ", num_stage); \
   }
 
 #define DISPATCH_CACHE_TYPE(cache_type, cache_type_now, cache_bytes, ...) \
@@ -328,6 +390,8 @@ __forceinline__ __host__ __device__ void vec_cast<nv_bfloat16, float>(
     constexpr CacheType cache_type_now = CacheType::CacheInt4CwZp;        \
     constexpr size_t cache_bytes = 4;                                     \
     __VA_ARGS__                                                           \
+  } else {                                                                \
+    PD_THROW("not support the cache_type: ", cache_type);                 \
   }
 
 #define DISPATCH_DEAL_EACH_TIME(deal_each_time, DEAL_EACH_TIME, ...) \
@@ -337,6 +401,8 @@ __forceinline__ __host__ __device__ void vec_cast<nv_bfloat16, float>(
   } else if (deal_each_time == 64) {                                 \
     constexpr size_t DEAL_EACH_TIME = 64;                            \
     __VA_ARGS__                                                      \
+  } else {                                                           \
+    PD_THROW("not support the deal_each_time", deal_each_time);      \
   }
 
 #define DISPATCH_NUM_THREADS(num_threads, NUM_THREADS, ...) \
@@ -346,6 +412,8 @@ __forceinline__ __host__ __device__ void vec_cast<nv_bfloat16, float>(
   } else if (num_threads == 256) {                          \
     constexpr size_t NUM_THREADS = 256;                     \
     __VA_ARGS__                                             \
+  } else {                                                  \
+    PD_THROW("not support the num_threads", num_threads);   \
   }
 
 #define DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, ...) \
@@ -376,6 +444,37 @@ __forceinline__ __host__ __device__ void vec_cast<nv_bfloat16, float>(
   } else if (group_size == 12) {                             \
     constexpr size_t GROUP_SIZE = 12;                        \
     __VA_ARGS__                                              \
+  } else if (group_size == 14) {                             \
+    constexpr size_t GROUP_SIZE = 14;                        \
+    __VA_ARGS__                                              \
+  } else if (group_size == 16) {                             \
+    constexpr size_t GROUP_SIZE = 16;                        \
+    __VA_ARGS__                                              \
+  } else {                                                   \
+    PD_THROW("not support the group_size", group_size);      \
+  }
+
+#define DISPATCH_DyCfp8(is_dynamic_cfp8, IsDynamicC8, ...) \
+  if (is_dynamic_cfp8) {                                   \
+    constexpr bool IsDynamicC8 = true;                     \
+    __VA_ARGS__                                            \
+  } else {                                                 \
+    constexpr bool IsDynamicC8 = false;                    \
+    __VA_ARGS__                                            \
+  }
+
+#define DISPATCH_MLA_GROUP_SIZE(group_size, GROUP_SIZE, ...) \
+  if (group_size == 8) {                                     \
+    constexpr size_t GROUP_SIZE = 8;                         \
+    __VA_ARGS__                                              \
+  } else if (group_size == 16) {                             \
+    constexpr size_t GROUP_SIZE = 16;                        \
+    __VA_ARGS__                                              \
+  } else if (group_size == 128) {                            \
+    constexpr size_t GROUP_SIZE = 128;                       \
+    __VA_ARGS__                                              \
+  } else {                                                   \
+    PD_THROW("not support the group_size: ", group_size);    \
   }
 
 #define DISPATCH_BLOCKSHAPE_Q(block_shape_q, BLOCK_SHAPE_Q, NUM_WARP_Q, ...) \
@@ -400,6 +499,9 @@ __forceinline__ __host__ __device__ void vec_cast<nv_bfloat16, float>(
 #define DISPATCH_CAUSAL(causal, CAUSAL, ...) \
   if (causal) {                              \
     constexpr bool CAUSAL = true;            \
+    __VA_ARGS__                              \
+  } else {                                   \
+    constexpr bool CAUSAL = false;           \
     __VA_ARGS__                              \
   }
 
@@ -444,9 +546,11 @@ inline HOSTDEVICE T roundWithTiesToEven(T x) {
           : xUpper);
 }
 
-
 template <typename T, bool is_need_kv_quant, bool IsFP8, int RoundType = 0>
-__host__ __device__ __forceinline__ uint8_t QuantToC8(const T scale, const T value, const float max_bound, const float min_bound) {
+__host__ __device__ __forceinline__ uint8_t QuantToC8(const T scale,
+                                                      const T value,
+                                                      const float max_bound,
+                                                      const float min_bound) {
   uint8_t eight_bits;
   float quant_value;
   if constexpr (is_need_kv_quant) {
@@ -478,11 +582,45 @@ __host__ __device__ __forceinline__ uint8_t QuantToC8(const T scale, const T val
   return eight_bits;
 }
 
-
-template <typename T, bool IsFP8>inline __device__ static void convert_c8(T * result, const uint32_t& source){
+template <typename T, bool IsFP8>
+inline __device__ static void convert_c8(T* result, const uint32_t& source) {
   if constexpr (IsFP8) {
     convert_fp8(result, source);
   } else {
     convert_int8(result, source);
   }
+}
+
+constexpr int kWarpSize = 32;
+
+template <typename T>
+inline __device__ void WelfordCombine1(T b_m2, T* m2) {
+  *m2 += b_m2;
+}
+
+template <typename T, int thread_group_width = kWarpSize>
+__inline__ __device__ void WelfordWarpReduce(T thread_m2, T* m2) {
+  *m2 = thread_m2;
+  for (int mask = thread_group_width / 2; mask > 0; mask >>= 1) {
+    T b_m2 = __shfl_xor_sync(0xffffffff, *m2, mask);
+    WelfordCombine1(b_m2, m2);
+  }
+}
+
+template <typename T, int thread_group_width = kWarpSize>
+__inline__ __device__ void WelfordWarpAllReduce(T thread_m2, T* m2) {
+  WelfordWarpReduce<T, thread_group_width>(thread_m2, m2);
+}
+
+template <typename T>
+__inline__ __device__ T Rsqrt(T x);
+
+template <>
+__inline__ __device__ float Rsqrt<float>(float x) {
+  return rsqrt(x);
+}
+
+template <>
+__inline__ __device__ double Rsqrt<double>(double x) {
+  return rsqrt(x);
 }

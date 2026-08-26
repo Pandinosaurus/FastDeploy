@@ -1,0 +1,159 @@
+#include "xpu/kernel/cluster.h"
+#include "xpu/kernel/cluster_debug.h"
+#include "xpu/kernel/cluster_partition.h"
+#include "xpu/kernel/cluster_primitive.h"
+#include "xpu/kernel/cluster_simd.h"
+
+namespace fd_xpu3 {
+__global__ void draft_model_preprocess(int64_t* draft_tokens,
+                                       int64_t* input_ids,
+                                       bool* stop_flags,
+                                       int* seq_lens_this_time,
+                                       int* seq_lens_encoder,
+                                       int* seq_lens_decoder,
+                                       int64_t* step_idx,
+                                       bool* not_need_stop,
+                                       int64_t* pre_ids,
+                                       const int64_t* accept_tokens,
+                                       const int* accept_num,
+                                       const int* target_model_seq_lens_encoder,
+                                       const int* target_model_seq_lens_decoder,
+                                       const int64_t* target_model_step_idx,
+                                       const bool* target_model_stop_flags,
+                                       const int64_t* max_dec_len,
+                                       int64_t* target_model_draft_tokens,
+                                       const int bsz,
+                                       const int num_model_step,
+                                       const int accept_tokens_len,
+                                       const int draft_tokens_len,
+                                       const int input_ids_len,
+                                       const int target_model_draft_tokens_len,
+                                       const int pre_ids_len,
+                                       const bool is_splitwise_prefill) {
+  int cid = core_id();
+  int ncores = core_num();
+  int clusterid = cluster_id();
+  int nclusters = cluster_num();
+  int tid = clusterid * ncores + cid;
+  __shared__ int not_stop_flag_sm[64];
+  not_stop_flag_sm[cid] = 0;
+  int64_t accept_tokens_now[128];
+
+  int64_t value_fu = -1;
+
+  for (; tid < bsz; tid += ncores * nclusters) {
+    bool target_model_stop_flags_now = false;
+    bool stop_flags_now = false;
+    int seq_lens_this_time_now = 0;
+    int seq_lens_encoder_now = 0;
+    int seq_lens_decoder_now = 0;
+    int seq_lens_decoder_new = 0;
+    int accept_num_now = 0;
+    int target_model_seq_lens_decoder_now = 0;
+    int64_t step_id_now = 0;
+    int64_t target_model_step_idx_now = 0;
+    int64_t max_dec_len_now = 0;
+
+    mfence();
+    GM2LM_ASYNC(target_model_stop_flags + tid,
+                &target_model_stop_flags_now,
+                sizeof(bool));
+    GM2LM_ASYNC(seq_lens_encoder + tid, &seq_lens_encoder_now, sizeof(int));
+    GM2LM_ASYNC(seq_lens_decoder + tid, &seq_lens_decoder_now, sizeof(int));
+    GM2LM_ASYNC(target_model_seq_lens_decoder + tid,
+                &target_model_seq_lens_decoder_now,
+                sizeof(int));
+    GM2LM_ASYNC(accept_tokens + tid * accept_tokens_len,
+                accept_tokens_now,
+                accept_tokens_len * sizeof(int64_t));
+    GM2LM_ASYNC(accept_num + tid, &accept_num_now, sizeof(int));
+    GM2LM_ASYNC(target_model_step_idx + tid,
+                &target_model_step_idx_now,
+                sizeof(int64_t));
+    GM2LM(max_dec_len + tid, &max_dec_len_now, sizeof(int64_t));
+
+    // Clear target_model_draft_tokens (keep first token)
+    for (int i = 1; i < target_model_draft_tokens_len; i++) {
+      LM2GM_ASYNC(
+          &value_fu,
+          target_model_draft_tokens + tid * target_model_draft_tokens_len + i,
+          sizeof(int64_t));
+    }
+
+    // Decision: Should MTP/Draft model run?
+    bool should_skip = false;
+    if (target_model_stop_flags_now) {
+      should_skip = true;
+    }
+    if (!is_splitwise_prefill &&
+        target_model_step_idx_now + num_model_step >= max_dec_len_now) {
+      should_skip = true;
+    }
+
+    // Default: preserve original seq_lens_decoder (prefill path doesn't modify
+    // it)
+    seq_lens_decoder_new = seq_lens_decoder_now;
+
+    if (should_skip) {
+      stop_flags_now = true;
+      seq_lens_this_time_now = 0;
+      seq_lens_decoder_new = 0;
+      seq_lens_encoder_now = 0;
+      step_id_now = 0;
+    } else {
+      not_stop_flag_sm[cid] += 1;
+      stop_flags_now = false;
+
+      if (seq_lens_encoder_now > 0) {
+        int64_t target_model_first_token = accept_tokens_now[0];
+        LM2GM(&target_model_first_token,
+              pre_ids + tid * pre_ids_len,
+              sizeof(int64_t));
+        LM2GM(&target_model_first_token,
+              input_ids + tid * input_ids_len + seq_lens_encoder_now - 1,
+              sizeof(int64_t));
+        seq_lens_this_time_now = seq_lens_encoder_now;
+        step_id_now = target_model_step_idx_now - 1;
+      } else {
+        // Decode: MTP shadow state from target model
+        int32_t need_compute_token = accept_num_now;
+        seq_lens_decoder_new =
+            target_model_seq_lens_decoder_now - need_compute_token;
+        step_id_now = target_model_step_idx_now - need_compute_token;
+
+        for (int i = 0; i < accept_num_now; i++) {
+          const int pre_id_pos =
+              target_model_step_idx_now - (accept_num_now - i);
+          LM2GM(accept_tokens_now + i,
+                draft_tokens + tid * draft_tokens_len + i,
+                sizeof(int64_t));
+          LM2GM(accept_tokens_now + i,
+                pre_ids + tid * pre_ids_len + pre_id_pos,
+                sizeof(int64_t));
+        }
+        seq_lens_this_time_now = accept_num_now;
+      }
+    }
+    LM2GM_ASYNC(&stop_flags_now, stop_flags + tid, sizeof(bool));
+    LM2GM_ASYNC(&seq_lens_decoder_new, seq_lens_decoder + tid, sizeof(int));
+    LM2GM_ASYNC(&seq_lens_this_time_now, seq_lens_this_time + tid, sizeof(int));
+    LM2GM_ASYNC(&seq_lens_encoder_now, seq_lens_encoder + tid, sizeof(int));
+    LM2GM_ASYNC(&step_id_now, step_idx + tid, sizeof(int64_t));
+  }
+  mfence();
+  sync_cluster();
+  bool value_true = true;
+  bool value_false = false;
+  if (cid == 0) {
+    for (int i = 1; i < ncores; i++) {
+      not_stop_flag_sm[0] += not_stop_flag_sm[i];
+    }
+    if (not_stop_flag_sm[0] > 0) {
+      LM2GM(&value_true, not_need_stop, sizeof(bool));
+    } else {
+      LM2GM(&value_false, not_need_stop, sizeof(bool));
+    }
+  }
+}
+
+}  // namespace fd_xpu3
